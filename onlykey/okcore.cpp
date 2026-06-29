@@ -441,8 +441,23 @@ void recvmsg(int n)
 				if (profilemode != NONENCRYPTEDPROFILE)
 				{
 					#ifdef STD_VERSION
-					if (recv_buffer[0] != 0xBA)
+					if (recv_buffer[0] != 0xBA) {
+						// A host may only set keys in user slots: RSA 1-4 or ECC
+						// 101-116. Reserved ECC slots 117-132 are off-limits to host
+						// key writes, with ONE exception: the designated backup key
+						// (slot 131 with the backup type flag 0x80), which the app
+						// legitimately sets via setBackupPassphrase. HMAC (129/130,
+						// set via the YUBIAUTH/feature-report handler) and derivation
+						// (128/132, set internally) use other paths that call
+						// set_private() directly and bypass this dispatch, so they
+						// are unaffected either way.
+						if (recv_buffer[5] >= 117 && recv_buffer[5] <= 132 &&
+							!(recv_buffer[5] == RESERVED_KEY_DEFAULT_BACKUP && (recv_buffer[6] & 0x80))) {
+							hidprint("Error cannot set key in reserved slot (117-132)");
+							return;
+						}
 						set_private(recv_buffer);
+					}
 					#endif
 				}
 			}

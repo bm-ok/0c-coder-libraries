@@ -207,8 +207,52 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 					return ret;
 				}
 				memcpy(additional_data+1, client_handle+43, 32); // 32 bytes of data to include in key derivation
-				opt2++; 
+				opt2++;
 				memset(ecc_public_key, 0, sizeof(ecc_public_key));
+
+				// ---- X-Wing (mlkem768x25519) split custody -------------------
+				// UNTESTED — validate on hardware. Wire keytype 5 -> opt2==KEYTYPE_XWING(6).
+				// Returns 64 bytes, encrypted under the transit key when opt3:
+				//   DERIVE_PUBLIC_KEY -> [ pk_X(32) | mlkem_seed(32) ]
+				//   DERIVE_SHAREDSEC  -> [ ss_X(32) | mlkem_seed(32) ]
+				// sk_X (X25519) never leaves the device; the browser expands
+				// mlkem_seed and does the ML-KEM half locally. See
+				// onlykey.github.io src/plugins/age/INTEGRATION.md.
+				if (opt2 == KEYTYPE_XWING) {
+					// sk_X + pk_X from the web-derivation key (same as CURVE25519 path)
+					okcrypto_derive_key(KEYTYPE_CURVE25519, additional_data, RESERVED_KEY_WEB_DERIVATION);
+					// mlkem_seed = SHA256( sk_X || tag ) : one-way, domain-separated (!= sk_X)
+					uint8_t xwing_seed[32];
+					const char xwtag[] = "onlykey/xwing/mlkem768-seed/v1";
+					SHA256_CTX xc; sha256_init(&xc);
+					sha256_update(&xc, ecc_private_key, 32);
+					sha256_update(&xc, (const uint8_t*)xwtag, sizeof(xwtag) - 1);
+					sha256_final(&xc, xwing_seed);
+					uint8_t *xout = temp + 32 + sizeof(UNLOCKED) + 1;
+					if (opt1 == DERIVE_SHAREDSEC || opt1 == DERIVE_SHAREDSEC_REQ_PRESS) {
+						if (opt1 == DERIVE_SHAREDSEC_REQ_PRESS) {
+							int but;
+							device_set_status(CTAPHID_STATUS_UPNEEDED);
+							but = ctap_user_presence_test(CTAP2_UP_DELAY_MS);
+							if (but > 1) return CTAP2_ERR_PROCESSING;
+							else if (but < 0) return CTAP2_ERR_KEEPALIVE_CANCEL;
+							else if (but == 0) { pending_operation = 0; return CTAP2_ERR_ACTION_TIMEOUT; }
+						}
+						// ss_X = X25519(sk_X, ct_X); ct_X = input pubkey from the age stanza
+						uint8_t *ct_X = client_handle + 43 + 32;
+						if (okcrypto_shared_secret(ct_X, xout)) {
+							ret = CTAP2_ERR_OPERATION_DENIED;
+							printf2(TAG_ERR, "Error with X-Wing ss_X\n");
+							return ret;
+						}
+					} else {
+						memcpy(xout, ecc_public_key, 32); // pk_X
+					}
+					memcpy(xout + 32, xwing_seed, 32);    // mlkem_seed
+					send_transport_response(temp, 32 + sizeof(UNLOCKED) + 1 + 64, opt3, false);
+					ret = send_stored_response(output);
+					return ret;
+				}
 
 				//Similar format to SSH derivation but use RESERVED_KEY_WEB_DERIVATION key
 				if (opt2 == KEYTYPE_NACL || opt2 == KEYTYPE_CURVE25519) {

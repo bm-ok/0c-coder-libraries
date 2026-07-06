@@ -86,6 +86,7 @@ extern "C"
 
 #include <SoftTimer.h>
 #include "base64.h"
+#include "okpqc.h"
 
 /*************************************/
 //Firmware Memory Locations

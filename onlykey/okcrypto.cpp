@@ -152,6 +152,7 @@ void okcrypto_sign (uint8_t *buffer) {
 		#ifdef DEBUG
 		Serial.print(features, BIN);
 		#endif
+		if ((type & 0x0F) == KEYTYPE_PQC_PGP) { okpqc_sign(buffer); return; }
 		if (is_bit_set(features, 6)) {
 			okcrypto_rsasign(buffer);
 		} else {
@@ -219,6 +220,7 @@ void okcrypto_decrypt (uint8_t *buffer){
 			fadeoff(0);
 			return;
 		}
+		if ((type & 0x0F) == KEYTYPE_PQC_PGP) { okpqc_decrypt(buffer); return; }
 		if (is_bit_set(features, 5)) {
 			okcrypto_rsadecrypt(buffer);
 		} else {

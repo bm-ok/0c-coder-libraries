@@ -5061,6 +5061,12 @@ int okcore_flashget_RSA(uint8_t slot)
 	{
 		type = (type & 0x0F);
 	}
+	if (type == KEYTYPE_PQC_PGP) { // composite PQC PGP key: 160-byte seed blob
+		adr = adr + ((slot * MAX_RSA_KEY_SIZE) - MAX_RSA_KEY_SIZE);
+		okcore_flashget_common((uint8_t *)rsa_private_key, (unsigned long *)adr, PQC_PGP_BLOB_LEN);
+		okcore_aes_gcm_decrypt(rsa_private_key, slot, features, profilekey, PQC_PGP_BLOB_LEN);
+		return features;
+	}
 #ifdef DEBUG
 	Serial.print("Type of RSA KEY is ");
 	Serial.println(type, HEX);
@@ -5154,6 +5160,15 @@ void rsa_priv_flash(uint8_t *buffer, bool wipe)
 	{ //Expect 512 Bytes
 		keysize = 512;
 		if (buffer[0] != 0xBA && packet_buffer_offset <= 456)
+		{
+			memcpy(rsa_private_key + packet_buffer_offset, buffer + 7, 57);
+			packet_buffer_offset = packet_buffer_offset + 57;
+		}
+	}
+	else if ((buffer[6] & 0x0F) == KEYTYPE_PQC_PGP)
+	{ // composite PQC PGP key: 160-byte seed blob
+		keysize = PQC_PGP_BLOB_LEN;
+		if (buffer[0] != 0xBA && packet_buffer_offset < PQC_PGP_BLOB_LEN)
 		{
 			memcpy(rsa_private_key + packet_buffer_offset, buffer + 7, 57);
 			packet_buffer_offset = packet_buffer_offset + 57;

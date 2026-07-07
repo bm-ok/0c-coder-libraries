@@ -143,6 +143,8 @@
  */
 #define MLD_CONFIG_NO_VERIFY_API   /* OnlyKey: device never verifies (openpgp.js does) */
 
+#define MLD_CONFIG_SERIAL_FIPS202_ONLY   /* OnlyKey: scalar SHAKE (no SIMD on M4) */
+
 /**
  * MLD_CONFIG_CORE_API_ONLY
  *

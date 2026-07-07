@@ -141,7 +141,7 @@
  * crypto_sign_verify_pre_hash_shake256, and all internal APIs
  * only needed by those functions.
  */
-/* #define MLD_CONFIG_NO_VERIFY_API */
+#define MLD_CONFIG_NO_VERIFY_API   /* OnlyKey: device never verifies (openpgp.js does) */
 
 /**
  * MLD_CONFIG_CORE_API_ONLY

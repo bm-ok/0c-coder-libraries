@@ -96,7 +96,7 @@
 //ML-KEM-768 (FIPS 203) support
 /*************************************/
 extern "C" {
-#include "mlkem_native/mlkem_native.h"
+#include "mlkem_native.h"
 }
 
 // Access SHA3-256 and SHAKE256 from mlkem-native (already compiled in)

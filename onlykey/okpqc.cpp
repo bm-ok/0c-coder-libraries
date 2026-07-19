@@ -24,9 +24,9 @@ extern "C" int PQCP_MLDSA_NATIVE_MLDSA65_keypair_internal(uint8_t *pk, uint8_t *
 extern "C" int PQCP_MLDSA_NATIVE_MLDSA65_signature(uint8_t *sig, size_t *siglen,
                    const uint8_t *m, size_t mlen, const uint8_t *ctx, size_t ctxlen, const uint8_t *sk);
 
-/* ---- firmware RNG bridges required by mlkem_native / mldsa_native configs ----
- * RNG is the Arduino Crypto library global (RNG.h), as used elsewhere in the firmware. */
-extern "C" int onlykey_mlkem_randombytes(uint8_t *out, size_t outlen) { RNG.rand(out, (size_t)outlen); return 0; }
+/* ---- firmware RNG bridge required by mldsa_native config ----
+ * RNG is the Arduino Crypto library global (RNG.h), as used elsewhere in the firmware.
+ * (onlykey_mlkem_randombytes is already defined in okcrypto.cpp for mlkem_native's config.) */
 extern "C" int onlykey_mldsa_randombytes(uint8_t *out, size_t outlen) { RNG.rand(out, (size_t)outlen); return 0; }
 
 /* ---- firmware globals/APIs (okcore.cpp / okcrypto.cpp) ---- */

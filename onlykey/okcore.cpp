@@ -2318,7 +2318,11 @@ void fadeout()
 
 #ifdef DEBUG
 int lastIncomingSerialByte = 0;
-bool wipeConfirmPending = false;
+// 0 = no wipe armed, 1 = userspace-only wipe armed ('0'), 2 = full wipe armed ('9')
+uint8_t wipeConfirmPending = 0;
+#define WIPE_PENDING_NONE 0
+#define WIPE_PENDING_USERSPACE 1
+#define WIPE_PENDING_FULL 2
 #endif
 
 int touch_sense_loop () {
@@ -2454,11 +2458,20 @@ int touch_sense_loop () {
 	#ifdef DEBUG
 	// Simulated button presses for controlled testing, sent as ASCII digits '1'-'6'
 	// over the Serial (SEREMU) channel, terminated by return (short press) or space (long press).
-	// '0' is not a real button - it's a debug-only command that wipes the device back to a
-	// clean, unconfigured state (same flash+EEPROM wipe as factorydefault()/self-destruct PIN).
-	// Requires the space (long-press) terminator, same as physical destructive-action holds,
-	// PLUS a second explicit "C" confirmation (also long-press-terminated) before it actually
-	// wipes, so it can't be triggered by a single accidental "0 ".
+	// '0' and '9' are not real buttons - they are debug-only commands that wipe the device back
+	// to a clean, unconfigured state. Both require the space (long-press) terminator, same as
+	// physical destructive-action holds, PLUS a second explicit 'C' confirmation (also
+	// long-press-terminated) before anything actually wipes, so it can't be triggered by a
+	// single accidental "0 " or "9 ":
+	//   '0' then 'C' -> userspace-only wipe (PIN/profile/slot data - wipeuserspace(), no reflash needed)
+	//   '9' then 'C' -> full wipe (also erases the firmware hash and forces the bootloader - factorydefault())
+	// '8' is a separate debug-only command that just restarts the device (CPU_RESTART()) -
+	// no data is touched, so no confirmation step is needed. Needed because completing PIN
+	// setup via the bare OKPIN/OKPINSEC/OKPINSD HID messages (as OnlyKeyWizard.js does)
+	// commits flash state but does not itself reboot - only the physical-button-driven
+	// okcore_quick_setup() flow reaches the CPU_RESTART() at the end of backup-passphrase
+	// generation. 'initialized' is only recomputed from flash at boot (OnlyKey.ino setup()),
+	// so a restart is required before a freshly-set PIN shows up as INITIALIZED.
 	if (Serial.available() > 0) { //if we have any data in the Serial input
 	    int incomingByte = Serial.read(); //trim off the first byte off Serial input buffer
 
@@ -2466,29 +2479,48 @@ int touch_sense_loop () {
 		Serial.print("I received from DEBUG: ");
 		Serial.println(lastIncomingSerialByte, DEC);
 
-		if (lastIncomingSerialByte == 48) { //0 - DEBUG-only wipe/reset command
+		if (lastIncomingSerialByte == 48) { //0 - DEBUG-only userspace wipe/reset command
 			if (incomingByte == 32) { //require long-press (space) terminator
-				wipeConfirmPending = true;
-				Serial.println("DEBUG: '0' reset requested - send 'C' (long-press) to confirm wipe, or anything else to cancel");
+				wipeConfirmPending = WIPE_PENDING_USERSPACE;
+				Serial.println("DEBUG: '0' userspace wipe requested - send 'C' (long-press) to confirm, or anything else to cancel");
 			} else {
 				Serial.println("DEBUG: '0' reset command ignored, hold with space (long-press) to confirm");
 			}
 			lastIncomingSerialByte = incomingByte;
 			return 0;
-		} else if (lastIncomingSerialByte == 67) { //C - confirms a pending '0' wipe
-			if (wipeConfirmPending && incomingByte == 32) { //require long-press (space) terminator
-				wipeConfirmPending = false;
-				Serial.println("DEBUG: 'C' confirmation received, wiping device to a clean state...");
-				factorydefault(); //wipes EEPROM+flash and restarts, does not return
-			} else if (wipeConfirmPending) {
+		} else if (lastIncomingSerialByte == 57) { //9 - DEBUG-only full wipe command (firmware + userspace)
+			if (incomingByte == 32) { //require long-press (space) terminator
+				wipeConfirmPending = WIPE_PENDING_FULL;
+				Serial.println("DEBUG: '9' full wipe requested - send 'C' (long-press) to confirm, or anything else to cancel");
+			} else {
+				Serial.println("DEBUG: '9' reset command ignored, hold with space (long-press) to confirm");
+			}
+			lastIncomingSerialByte = incomingByte;
+			return 0;
+		} else if (lastIncomingSerialByte == 56) { //8 - DEBUG-only restart command, no data touched
+			Serial.println("DEBUG: '8' restart requested, restarting now...");
+			CPU_RESTART(); //does not return
+			return 0;
+		} else if (lastIncomingSerialByte == 67) { //C - confirms a pending '0' or '9' wipe
+			if (wipeConfirmPending != WIPE_PENDING_NONE && incomingByte == 32) { //require long-press (space) terminator
+				uint8_t confirmedWipe = wipeConfirmPending;
+				wipeConfirmPending = WIPE_PENDING_NONE;
+				if (confirmedWipe == WIPE_PENDING_FULL) {
+					Serial.println("DEBUG: 'C' confirmation received, performing full wipe (firmware + userspace)...");
+					factorydefault(); //wipes EEPROM+flash+firmware hash and restarts, does not return
+				} else {
+					Serial.println("DEBUG: 'C' confirmation received, wiping userspace only...");
+					wipeuserspace(); //wipes PIN/profile/slot data only, does NOT touch firmware; restarts, does not return
+				}
+			} else if (wipeConfirmPending != WIPE_PENDING_NONE) {
 				Serial.println("DEBUG: 'C' confirmation ignored, hold with space (long-press) to confirm");
 			} else {
-				Serial.println("DEBUG: 'C' received but no '0' reset is pending, ignoring");
+				Serial.println("DEBUG: 'C' received but no '0'/'9' reset is pending, ignoring");
 			}
 			lastIncomingSerialByte = incomingByte;
 			return 0;
 		}
-		wipeConfirmPending = false; //any other command cancels a pending wipe confirmation
+		wipeConfirmPending = WIPE_PENDING_NONE; //any other command cancels a pending wipe confirmation
 		if (lastIncomingSerialByte == 49) { //1
 			button_selected = '1';
 			key_press = 1;
@@ -2845,6 +2877,25 @@ void byteprint(uint8_t *bytes, int size)
 	}
 	Serial.println();
 #endif
+}
+
+// Wipes PIN/profile/slot data only - never touches the firmware hash bytes or
+// the bootloader-entry flag, so unlike factorydefault() in FULLWIPE mode this
+// never forces a reflash. Used by the DEBUG serial '0'/'C' test command so
+// automated test runs can reset device state without needing a human to
+// reflash between runs.
+void wipeuserspace()
+{
+	wipeEEPROM();
+	wipeflashdata();
+	initialized = false;
+	unlocked = true;
+#ifdef DEBUG
+	Serial.println("userspace wipe has been completed");
+#endif
+	hidprint("userspace wipe has been completed");
+	delay(100);
+	CPU_RESTART();
 }
 
 void factorydefault()
@@ -5054,6 +5105,34 @@ void ecc_priv_flash(uint8_t *buffer, bool wipe)
 	int gen_key = buffer[7] + buffer[8] + buffer[9] + buffer[10] + buffer[11] + buffer[12] + buffer[13] + buffer[14];
 	if (gen_key == 2040)
 	{ //All FFs, trigger to generate a randomly generated key
+		uint8_t basetype = buffer[6] & 0x0F;
+		if (basetype == KEYTYPE_MLKEM768 || basetype == KEYTYPE_XWING) {
+			// PQC keygen requires an explicit button-confirmation challenge
+			// first, same pattern as decaps (okcrypto_xwing_decaps /
+			// okcrypto_mlkem_decaps): prime the 3-button challenge via
+			// process_packets()/done_process_packets() and wait for
+			// CRYPTO_AUTH to reach 4 (set by the button-press handler in
+			// OnlyKey.ino) before actually generating anything. Without
+			// this gate, okcrypto_xwing_keygen()/okcrypto_mlkem_keygen()'s
+			// own `if (!CRYPTO_AUTH)` check can never be satisfied - CRYPTO_AUTH
+			// is otherwise only ever primed by the decaps functions, for their
+			// own unrelated operations.
+			if (!CRYPTO_AUTH) {
+				uint8_t primebuf[64];
+				memset(primebuf, 0, 64);
+				primebuf[4] = buffer[4];
+				primebuf[5] = buffer[5];
+				primebuf[6] = 9; // final-packet length: 1 (keytype) + 8 (trigger bytes)
+				primebuf[7] = buffer[6];
+				memcpy(primebuf + 8, buffer + 7, 8);
+				process_packets(primebuf, 0, 0);
+				pending_operation = CTAP2_ERR_USER_ACTION_PENDING;
+				return;
+			} else if (CRYPTO_AUTH != 4) {
+				return; // challenge in progress, ignore re-entrant triggers
+			}
+			// CRYPTO_AUTH==4: confirmed via the 3-button challenge, proceed.
+		}
 		okcrypto_generate_random_key(buffer);
 	}
 #ifdef DEBUG

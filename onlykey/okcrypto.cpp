@@ -1807,13 +1807,16 @@ void okcrypto_mlkem_keygen (uint8_t *buffer) {
 
 	// Generate 32-byte seed, store via existing ECC slot infrastructure
 	// buffer[5] = slot (set by caller), buffer[6] = type, buffer[7..38] = key data
+	uint8_t seed[32];
 	RNG2(buffer + 7, 32);
+	memcpy(seed, buffer + 7, 32); // ecc_priv_flash() below encrypts buffer+7 in place (gcm.encrypt(state,state,len)) - keep the plaintext for the expansion below
 	buffer[6] = (KEYTYPE_MLKEM768 & 0x0F) | 0x20; // type with decrypt feature (bit 5)
 	ecc_priv_flash(buffer, false);
 
 	// Expand seed to 64-byte coins: SHAKE256(seed, 64)
 	uint8_t coins[64];
-	xwing_shake256(coins, 64, buffer + 7, 32);
+	xwing_shake256(coins, 64, seed, 32);
+	memset(seed, 0, sizeof(seed));
 
 	// Deterministic keygen
 	uint8_t *sk = ctap_buffer;
@@ -1947,13 +1950,16 @@ void okcrypto_xwing_keygen (uint8_t *buffer) {
 	}
 
 	// Generate 32-byte seed, store via existing ECC slot infrastructure
+	uint8_t seed[XWING_SEED_SIZE];
 	RNG2(buffer + 7, XWING_SEED_SIZE);
+	memcpy(seed, buffer + 7, XWING_SEED_SIZE); // ecc_priv_flash() below encrypts buffer+7 in place (gcm.encrypt(state,state,len)) - keep the plaintext for the expansion below
 	buffer[6] = (KEYTYPE_XWING & 0x0F) | 0x20; // type with decrypt feature (bit 5)
 	ecc_priv_flash(buffer, false);
 
 	// Expand seed: SHAKE256(seed, 96)
 	uint8_t expanded[96];
-	xwing_shake256(expanded, 96, buffer + 7, XWING_SEED_SIZE);
+	xwing_shake256(expanded, 96, seed, XWING_SEED_SIZE);
+	memset(seed, 0, sizeof(seed));
 
 	// ML-KEM-768 deterministic keygen from expanded[0:64]
 	uint8_t *sk_M = ctap_buffer;

@@ -289,6 +289,7 @@ extern void hidprint(char const * chars);
 extern void keytype(char const * chars);
 extern void byteprint(uint8_t* bytes, int size);
 extern void factorydefault();
+extern void wipeuserspace();
 extern void wipeEEPROM();
 extern void wipeflashdata();
 extern bool unlocked;

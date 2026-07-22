@@ -2316,6 +2316,11 @@ void fadeout()
 	}
 }
 
+#ifdef DEBUG
+int lastIncomingSerialByte = 0;
+bool wipeConfirmPending = false;
+#endif
+
 int touch_sense_loop () {
 
 	static int key_on=0;
@@ -2446,6 +2451,70 @@ int touch_sense_loop () {
 		#endif
 	}
 
+	#ifdef DEBUG
+	// Simulated button presses for controlled testing, sent as ASCII digits '1'-'6'
+	// over the Serial (SEREMU) channel, terminated by return (short press) or space (long press).
+	// '0' is not a real button - it's a debug-only command that wipes the device back to a
+	// clean, unconfigured state (same flash+EEPROM wipe as factorydefault()/self-destruct PIN).
+	// Requires the space (long-press) terminator, same as physical destructive-action holds,
+	// PLUS a second explicit "C" confirmation (also long-press-terminated) before it actually
+	// wipes, so it can't be triggered by a single accidental "0 ".
+	if (Serial.available() > 0) { //if we have any data in the Serial input
+	    int incomingByte = Serial.read(); //trim off the first byte off Serial input buffer
+
+	    if (incomingByte == 10 || incomingByte == 32) { //return or space
+		Serial.print("I received from DEBUG: ");
+		Serial.println(lastIncomingSerialByte, DEC);
+
+		if (lastIncomingSerialByte == 48) { //0 - DEBUG-only wipe/reset command
+			if (incomingByte == 32) { //require long-press (space) terminator
+				wipeConfirmPending = true;
+				Serial.println("DEBUG: '0' reset requested - send 'C' (long-press) to confirm wipe, or anything else to cancel");
+			} else {
+				Serial.println("DEBUG: '0' reset command ignored, hold with space (long-press) to confirm");
+			}
+			lastIncomingSerialByte = incomingByte;
+			return 0;
+		} else if (lastIncomingSerialByte == 67) { //C - confirms a pending '0' wipe
+			if (wipeConfirmPending && incomingByte == 32) { //require long-press (space) terminator
+				wipeConfirmPending = false;
+				Serial.println("DEBUG: 'C' confirmation received, wiping device to a clean state...");
+				factorydefault(); //wipes EEPROM+flash and restarts, does not return
+			} else if (wipeConfirmPending) {
+				Serial.println("DEBUG: 'C' confirmation ignored, hold with space (long-press) to confirm");
+			} else {
+				Serial.println("DEBUG: 'C' received but no '0' reset is pending, ignoring");
+			}
+			lastIncomingSerialByte = incomingByte;
+			return 0;
+		}
+		wipeConfirmPending = false; //any other command cancels a pending wipe confirmation
+		if (lastIncomingSerialByte == 49) { //1
+			button_selected = '1';
+			key_press = 1;
+		} else if (lastIncomingSerialByte == 50) { //2
+			button_selected = '2';
+			key_press = 1;
+		} else if (lastIncomingSerialByte == 51) { //3
+			button_selected = '3';
+			key_press = 1;
+		} else if (lastIncomingSerialByte == 52) { //4
+			button_selected = '4';
+			key_press = 1;
+		} else if (lastIncomingSerialByte == 53) { //5
+			button_selected = '5';
+			key_press = 1;
+		} else if (lastIncomingSerialByte == 54) { //6
+			button_selected = '6';
+			key_press = 1;
+	    	}
+	    	if (key_press == 1 && incomingByte == 32) //space
+	    		key_press = 128; //make it long press
+		}
+	    lastIncomingSerialByte = incomingByte; //save the byte for next loop
+	}
+	#endif
+
 	if ((key_press > 0) && (key_off > 2)) {
 		if (onlykeyhw==OK_HW_DUO && button_3_on) {
 			button_selected = '3';
@@ -2558,7 +2627,7 @@ void hidprint(char const *chars)
 
 void send_transport_response(uint8_t *data, int len, uint8_t encrypt, uint8_t store)
 {
-	#ifdef DEBUG
+	#ifdef DEBUG_CTAP_VERBOSE
 	Serial.println("Sending transport response data");
 	byteprint(data, len);
 	Serial.println(outputmode);
@@ -2573,7 +2642,7 @@ void send_transport_response(uint8_t *data, int len, uint8_t encrypt, uint8_t st
 			else {
 				memcpy(resp_buffer, data+i, len-i);
 			}
-			#ifdef DEBUG
+			#ifdef DEBUG_CTAP_VERBOSE
 			byteprint(resp_buffer, 64);
 			#endif
 			RawHID.send2(resp_buffer, 0);
@@ -2582,7 +2651,7 @@ void send_transport_response(uint8_t *data, int len, uint8_t encrypt, uint8_t st
 	else if (profilemode != NONENCRYPTEDPROFILE && outputmode == WEBAUTHN)
 	{ //Webauthn
 #ifdef STD_VERSION
-  #ifdef DEBUG
+  #ifdef DEBUG_CTAP_VERBOSE
       Serial.print ("FIDO Response");
 	  byteprint(data, len);
 #endif
@@ -2824,6 +2893,11 @@ void wipeEEPROM()
 	//Erase all EEPROM values
 	uint8_t value;
 #ifdef DEBUG
+	Serial.println("Wiping EEPROM...");
+#endif
+#ifdef DEBUG_CTAP_VERBOSE
+	//Full 2048-byte dump is very slow over Serial (thousands of print calls) - only enable
+	//for deep debugging, not on every wipe/factory reset under plain DEBUG.
 	Serial.println("Current EEPROM Values");
 	for (int i = 0; i < 2048; i++)
 	{
@@ -2839,21 +2913,19 @@ void wipeEEPROM()
 	{
 		EEPROM.write(i, value);
 	}
-#ifdef DEBUG
+#ifdef DEBUG_CTAP_VERBOSE
 	Serial.println("EEPROM set to 0s");
-#endif
 	for (int i = 0; i < 2048; i++)
 	{
 		value = EEPROM.read(i);
-#ifdef DEBUG
 		Serial.print(i);
 		Serial.print("\t");
 		Serial.print(value, DEC);
 		Serial.println();
-#endif
 	}
+#endif
 #ifdef DEBUG
-	Serial.println("EEPROM erased"); //TODO remove debug
+	Serial.println("EEPROM erased");
 #endif
 }
 

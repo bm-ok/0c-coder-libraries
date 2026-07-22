@@ -182,8 +182,8 @@ int device_is_nfc()
 
 void usbhid_send(uint8_t * msg)
 {
+    #ifdef DEBUG_CTAP_VERBOSE
     printf1(TAG_GREEN, "Sending FIDO response block");
-    #ifdef DEBUG
 	byteprint(msg, 64);
     #endif
     extern uint8_t useinterface;
@@ -206,10 +206,12 @@ int authenticator_read_state(AuthenticatorState * a)
 {
    	uint8_t buffer[sizeof(AuthenticatorState)];
     int ret;
+    #ifdef DEBUG_CTAP_VERBOSE
     printf1(TAG_GREEN, "authenticator_read_state");
+    #endif
 	ret = ctap_flash (0, buffer, sizeof(AuthenticatorState), 3);
 	memcpy((uint8_t*)a, buffer, sizeof(AuthenticatorState));
-    #ifdef DEBUG
+    #ifdef DEBUG_CTAP_VERBOSE
 	byteprint(buffer,sizeof(AuthenticatorState));
     #endif
     return ret;
@@ -218,14 +220,18 @@ int authenticator_read_state(AuthenticatorState * a)
 void authenticator_read_backup_state(AuthenticatorState * a)
 {
    	//This function is unnecessary, using EEPROM
+    #ifdef DEBUG_CTAP_VERBOSE
     printf1(TAG_GREEN, "authenticator_read_backup_state");
+    #endif
 }
 
 // Return 1 yes backup is init'd, else 0
 int authenticator_is_backup_initialized()
 {
     //This function is unnecessary, using EEPROM
+    #ifdef DEBUG_CTAP_VERBOSE
     printf1(TAG_GREEN, "authenticator_is_backup_initialized");
+    #endif
 	return 0;
 }
 
@@ -233,11 +239,13 @@ void authenticator_write_state(AuthenticatorState * a)
 {
 
 	uint8_t buffer[sizeof(AuthenticatorState)];
-    printf1(TAG_GREEN, "authenticator_write_state");
 	memcpy(buffer, (uint8_t*)a, sizeof(AuthenticatorState));
+    #ifdef DEBUG_CTAP_VERBOSE
+    printf1(TAG_GREEN, "authenticator_write_state");
     printf1(TAG_GREEN, "authenticator_write_state size %d\n", sizeof(AuthenticatorState));
+    #endif
     ctap_flash (0, buffer, sizeof(AuthenticatorState), 4);
-    #ifdef DEBUG
+    #ifdef DEBUG_CTAP_VERBOSE
 	byteprint(buffer,sizeof(AuthenticatorState));
     #endif
 }
@@ -297,7 +305,9 @@ void device_disable_up(bool disable)
 
 int ctap_user_presence_test(uint32_t wait)
 {
+    #ifdef DEBUG_CTAP_VERBOSE
     printf1(TAG_GREEN, "ctap_user_presence_test");
+    #endif
     extern Adafruit_NeoPixel pixels;
     int ret = 0;
     uint32_t t1 = millis();

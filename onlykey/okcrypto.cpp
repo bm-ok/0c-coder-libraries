@@ -333,7 +333,25 @@ void okcrypto_decrypt (uint8_t *buffer){
 		okcrypto_ecdh(buffer);
 	} else {
 		if (buffer[5] > 100 && buffer[5] < 117) { // Keys 117 - 132 reserved
-			features = okcore_flashget_ECC ((int)buffer[5]);
+			// okcore_flashget_ECC() does a flash read + AES-GCM decrypt to
+			// populate ecc_private_key - expensive, and this dispatcher runs
+			// once per incoming HID report. For MLKEM/XWING, the multi-packet
+			// ciphertext send (~20 reports for X-Wing) only actually needs
+			// ecc_private_key once CRYPTO_AUTH==4 (okcrypto_xwing_decaps()/
+			// okcrypto_mlkem_decaps() don't touch it before then - earlier
+			// reports just accumulate via process_packets()). Paying that
+			// cost on every one of ~20 reports was slow enough to cause real
+			// receive-side USB packet loss under the burst (confirmed live:
+			// only ~10 of ~20 chunks were arriving). type still needs
+			// refreshing every time for correct dispatch below, just not the
+			// expensive part - okeeprom_eeget_ecckey() is the cheap lookup
+			// okcore_flashget_ECC() itself starts with.
+			if ((type == KEYTYPE_MLKEM768 || type == KEYTYPE_XWING) && CRYPTO_AUTH && CRYPTO_AUTH != 4) {
+				okeeprom_eeget_ecckey(&type, buffer[5]);
+				type = type & 0x0F;
+			} else {
+				features = okcore_flashget_ECC ((int)buffer[5]);
+			}
 		}
 		if (type == 0) {
 			hidprint("Error no key set in this slot");

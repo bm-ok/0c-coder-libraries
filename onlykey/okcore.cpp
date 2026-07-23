@@ -7257,7 +7257,17 @@ void process_packets(uint8_t *buffer, int len, uint8_t *blocknum)
 	}
 	else
 	{ //Last packet
-		if (packet_buffer_offset <= (int)(PACKET_BUFFER_SIZE - 57) && buffer[6] <= 57 && buffer[6] >= 1)
+		// This used to reuse the not-last-packet branch's threshold
+		// (PACKET_BUFFER_SIZE - 57), which checks "is there room for
+		// another full 57-byte chunk" - too strict for the final,
+		// partial chunk. For a PACKET_BUFFER_SIZE that isn't an exact
+		// multiple of 57 (e.g. XWING_CT_SIZE=1120=19*57+37), the offset
+		// after 19 full chunks (1083) already exceeds that threshold
+		// (1063) even though the actual final append (1083+37=1120)
+		// fits exactly - so the last chunk was rejected 100% of the
+		// time and X-Wing/ML-KEM decapsulation could never complete.
+		// The real question is just whether *this* chunk fits.
+		if (packet_buffer_offset + buffer[6] <= (int)PACKET_BUFFER_SIZE && buffer[6] <= 57 && buffer[6] >= 1)
 		{
 			memcpy(packet_buffer + packet_buffer_offset, buffer + 7, buffer[6]);
 			packet_buffer_offset = packet_buffer_offset + buffer[6];

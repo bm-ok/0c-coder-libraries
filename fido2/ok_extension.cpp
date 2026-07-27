@@ -200,11 +200,27 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 				uint8_t additional_data[33] = {0};
 				if (opt1 == DERIVE_PUBLIC_KEY_REQ_PRESS || opt1 == DERIVE_SHAREDSEC_REQ_PRESS) {
 					additional_data[0] = 1; // Generate different key for REQ_PRESS than non REQ_PRESS
-				} else if (!(is_bit_set(derived_key_challenge_mode, 3))) {
-					//derived keys per site without touch not enabeled
-					ret = CTAP2_ERR_EXTENSION_NOT_SUPPORTED; //APPID doesn't match
-					wipedata();
-					return ret;
+				} else {
+					// derived_key_challenge_mode is a RAM cache of an EEPROM
+					// byte, unconditionally zeroed by wipetasks() and by every
+					// done_process_packets() call (the OnlyKey raw-HID
+					// pipeline - PIN unlock, status, OKCONNECT, SSH/GPG - a
+					// completely separate dispatch path from this FIDO2/CTAP
+					// one), and only reloaded there for slot codes >200 (an
+					// SSH/GPG-specific convention, okcrypto.cpp:207/369/650)
+					// that this FIDO2 path never sends. So the RAM copy is
+					// essentially always stale by the time this check runs,
+					// regardless of what's actually persisted in EEPROM.
+					// Reload directly here instead of trusting the cache -
+					// okeeprom_eeget_derived_key_challenge_mode() is a plain
+					// single-byte eeprom_read_byte(), no side effects.
+					okeeprom_eeget_derived_key_challenge_mode(&derived_key_challenge_mode);
+					if (!(is_bit_set(derived_key_challenge_mode, 3))) {
+						//derived keys per site without touch not enabeled
+						ret = CTAP2_ERR_EXTENSION_NOT_SUPPORTED; //APPID doesn't match
+						wipedata();
+						return ret;
+					}
 				}
 				memcpy(additional_data+1, client_handle+43, 32); // 32 bytes of data to include in key derivation
 				opt2++;
@@ -328,9 +344,13 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 						byteprint(temp+32+sizeof(UNLOCKED)+1+pubsize, 32);
 						#endif
 						send_transport_response(temp, 32+sizeof(UNLOCKED)+1+pubsize+sizeof(ecc_private_key), opt3, false); // Encrypt data in trasit using transit key if opt3 and send right away
+						ret = send_stored_response(output);
+						return ret;
 					}
 				} else { // Just Return DERIVE_PUBLIC_KEY
 					send_transport_response(temp, 32+sizeof(UNLOCKED)+1+pubsize, opt3, false); //Encrypt if opt3 and send right away
+					ret = send_stored_response(output);
+					return ret;
 				}
 			} else {
 				send_transport_response (temp, 32+sizeof(UNLOCKED)+1, opt3, false); //Encrypt if opt3 and send right away

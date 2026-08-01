@@ -11,11 +11,27 @@
  *
  * UNTESTED on hardware; the crypto core (keygen-from-seed + op) is verified on host.
  */
+#include "Arduino.h"
 #include "okpqc.h"
 #include <string.h>
 #include <Ed25519.h>
 #include "Curve25519.h"
 #include <RNG.h>
+
+/* Arduino compiles each .cpp as its own translation unit, and DEBUG is
+ * #define'd in onlykey.h / OnlyKey.ino - neither of which is included here.
+ * Every #ifdef DEBUG block in this file was therefore compiling to nothing,
+ * giving zero serial visibility into okpqc_sign()/okpqc_decrypt() while
+ * looking identical to instrumentation elsewhere that works.
+ *
+ * NOTE: this forces DEBUG on for this file regardless of build type, so a
+ * production (non-DEBUG) build would still compile this file's serial
+ * output. Fine for the DEBUG builds this harness drives - it is the only
+ * build with the SEREMU channel at all - but it should become a proper
+ * conditional include before anything ships. */
+#ifndef DEBUG
+#define DEBUG
+#endif
 
 /* ---- vendored PQC primitives (declared here to avoid pulling the big headers) ---- */
 extern "C" int PQCP_MLKEM_NATIVE_MLKEM768_keypair_derand(uint8_t *pk, uint8_t *dk, const uint8_t *coins /*64B seed*/);
@@ -37,7 +53,19 @@ extern int      large_buffer_offset;
 extern uint8_t  CRYPTO_AUTH;
 extern uint8_t  pending_operation;
 extern int      outputmode;
-extern uint32_t packet_buffer_details[];
+// The real definition (okcore.cpp:260) is `uint8_t packet_buffer_details[5]`.
+// Declaring it uint32_t here made every indexed access in this file use a
+// 4-byte stride, so the indices did not address the bytes they name:
+//   [0] -> byte 0   (correct only by coincidence)
+//   [1] -> byte 4   (wanted byte 1: the SLOT passed to the decrypt below)
+//   [2] -> bytes 8-11, i.e. entirely past the end of a 5-byte array
+// One mismatch, two visible failures, both confirmed on hardware: the
+// decrypt ran with the wrong slot and produced garbage, so large_buffer[0]
+// was not the component selector and okpqc_sign() took the ML-DSA branch for
+// a request that asked for the Ed25519 half; and `outputmode` was restored
+// from out-of-bounds memory, so it was never WEBAUTHN and the response went
+// out over raw HID instead of into the WebAuthn-retrievable buffer.
+extern uint8_t packet_buffer_details[];
 extern uint8_t  profilekey[];
 extern uint8_t  ctap_buffer[];           /* large scratch (>= MLDSA_SIG_SIZE 3309) */
 
@@ -78,6 +106,17 @@ static int okpqc_x25519_shared(uint8_t out[32], const uint8_t scalar[32], const 
 {
     uint8_t s[32], p[32];
     memcpy(s, scalar, 32); memcpy(p, point, 32);
+    // Curve25519::eval() does not clamp: it is a low-level curve evaluation
+    // that expects an already-clamped scalar. The library's own dh1() clamps
+    // explicitly before calling it, because it only ever handles freshly
+    // generated ephemerals. This function instead loads a stored scalar out
+    // of the composite blob, which was never clamped - yielding a different
+    // point than every RFC 7748-conformant implementation (openpgp.js and
+    // @noble both clamp internally, as the spec requires), so the shared
+    // secret never matched and composite decrypt failed AES key-wrap
+    // integrity even though the on-device math "succeeded".
+    s[0] &= 0xF8;
+    s[31] = (s[31] & 0x7F) | 0x40;
     bool ok = Curve25519::eval(out, s, p);
     memset(s, 0, sizeof s);
     return ok ? 0 : -1;

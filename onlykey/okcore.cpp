@@ -256,6 +256,11 @@ uint8_t ctap_buffer[CTAPHID_BUFFER_SIZE];
 // Reuse ctap_buffer as it uses 7K of RAM
 uint8_t *large_resp_buffer = ctap_buffer + CTAPHID_BUFFER_SIZE - LARGE_RESP_BUFFER_SIZE;				// Last 1024 bytes used to store temp data
 uint8_t *large_buffer = ctap_buffer + CTAPHID_BUFFER_SIZE - LARGE_RESP_BUFFER_SIZE - LARGE_BUFFER_SIZE; // Next 1024 bytes used to store temp data
+// Tracks how much of large_resp_buffer has been delivered, for the chunked
+// retrieval in send_stored_response() (ok_extension.cpp). Must be reset
+// wherever large_resp_buffer_offset is - it indexes into that buffer.
+int large_resp_buffer_cursor;
+uint8_t large_resp_buffer_last_opt3;
 uint8_t packet_buffer[PACKET_BUFFER_SIZE];
 uint8_t packet_buffer_details[5];
 uint8_t recv_buffer[64];
@@ -5779,6 +5784,12 @@ void wipetasks() {
 		memset(setBuffer, 0, 9);
 	}
 	large_resp_buffer_offset = 0;
+	// The chunked-retrieval cursor indexes into the buffer being invalidated
+	// here, so it must die with it. Left stale, the next response is served
+	// from the previous one's position - the caller gets its tail, or
+	// nothing, with no error anywhere.
+	large_resp_buffer_cursor = 0;
+	large_resp_buffer_last_opt3 = 0;
 	CRYPTO_AUTH = 0;
 	Challenge_button1 = 0;
 	Challenge_button2 = 0;
@@ -7354,6 +7365,9 @@ void done_process_packets()
 	okcore_aes_gcm_encrypt(packet_buffer, packet_buffer_details[0], packet_buffer_details[1], profilekey, packet_buffer_offset);
 	// Just in case there is still a response stored
 	large_resp_buffer_offset = 0;
+	// Same reasoning as the other reset site.
+	large_resp_buffer_cursor = 0;
+	large_resp_buffer_last_opt3 = 0;
 	memset(large_resp_buffer, 0, large_resp_buffer_offset);
 	// Move encrypted data to large_buffer
 	large_buffer_offset = packet_buffer_offset;

@@ -98,6 +98,12 @@
 
 extern uint8_t* large_resp_buffer;
 extern int large_resp_buffer_offset;
+extern int large_resp_buffer_cursor;
+extern uint8_t large_resp_buffer_last_opt3;
+// Max bytes of large_resp_buffer served per WebAuthn round trip. The real
+// destination is ctap.cpp's sigder[514] minus a status byte, i.e. 513 B -
+// stay safely under it.
+#define MAX_LARGE_RESP_CHUNK 500
 extern uint8_t profilemode;
 extern uint8_t isfade;
 extern uint8_t NEO_Color;
@@ -273,7 +279,7 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 						okcrypto_xwing_web_derive(label32, NULL, xout);
 					}
 					send_transport_response(temp, 32 + sizeof(UNLOCKED) + 1 + 64, opt3, false);
-					ret = send_stored_response(output);
+					ret = send_stored_response(output, opt3);
 					return ret;
 				}
 
@@ -315,7 +321,7 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 					if (os == 'W' && packet_buffer_details[3] == 'W') {
 						// Already generated shared secret, Windows duplicate request
 						packet_buffer_details[3] = 0; 
-						ret = send_stored_response(output);
+						ret = send_stored_response(output, opt3);
 						return ret;
 					}
 					else { 
@@ -351,12 +357,12 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 						byteprint(temp+32+sizeof(UNLOCKED)+1+pubsize, 32);
 						#endif
 						send_transport_response(temp, 32+sizeof(UNLOCKED)+1+pubsize+sizeof(ecc_private_key), opt3, false); // Encrypt data in trasit using transit key if opt3 and send right away
-						ret = send_stored_response(output);
+						ret = send_stored_response(output, opt3);
 						return ret;
 					}
 				} else { // Just Return DERIVE_PUBLIC_KEY
 					send_transport_response(temp, 32+sizeof(UNLOCKED)+1+pubsize, opt3, false); //Encrypt if opt3 and send right away
-					ret = send_stored_response(output);
+					ret = send_stored_response(output, opt3);
 					return ret;
 				}
 			} else {
@@ -426,7 +432,7 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 				ret = 0;
 				}
 		}
-		ret = send_stored_response(output);
+		ret = send_stored_response(output, opt3);
 		return ret;
 			
 		//if (!isfade) fadeon(NEO_Color);
@@ -437,7 +443,7 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
     return ret;
 }
 
-int16_t send_stored_response(uint8_t * output) {
+int16_t send_stored_response(uint8_t * output, uint8_t opt3) {
   int16_t ret = 0;
 	if(profilemode!=NONENCRYPTEDPROFILE) {
 		#ifdef DEBUG
@@ -452,15 +458,39 @@ int16_t send_stored_response(uint8_t * output) {
 			#endif
 			ret = CTAP2_ERR_OPERATION_PENDING;
 		} else if (large_resp_buffer_offset) {
-			extension_writeback_init(output, large_resp_buffer_offset);
-			extension_writeback(large_resp_buffer, large_resp_buffer_offset);
+			// Chunked retrieval: large_resp_buffer_offset can exceed what one
+			// WebAuthn assertion carries (a 3309 B ML-DSA-65 signature vs.
+			// ~513 B usable), so a full response may take several OKPING
+			// polls. large_resp_buffer_cursor tracks what has been delivered.
+			//
+			// opt3 <= large_resp_buffer_last_opt3 means this poll duplicates
+			// the one just answered (the Windows 10 1903 double-fire this file
+			// guards against elsewhere via packet_buffer_details[3]) - re-serve
+			// the same bytes rather than advancing, or a duplicate silently
+			// skips a chunk and corrupts the reassembled response.
+			int is_duplicate = large_resp_buffer_last_opt3 && opt3 <= large_resp_buffer_last_opt3;
+			int chunk_start = is_duplicate
+				? (large_resp_buffer_cursor > MAX_LARGE_RESP_CHUNK ? large_resp_buffer_cursor - MAX_LARGE_RESP_CHUNK : 0)
+				: large_resp_buffer_cursor;
+			int remaining = large_resp_buffer_offset - chunk_start;
+			int chunk_len = remaining > MAX_LARGE_RESP_CHUNK ? MAX_LARGE_RESP_CHUNK : remaining;
+			extension_writeback_init(output, chunk_len);
+			extension_writeback(large_resp_buffer + chunk_start, chunk_len);
+			if (!is_duplicate) {
+				large_resp_buffer_cursor = chunk_start + chunk_len;
+				large_resp_buffer_last_opt3 = opt3;
+			}
 			// Windows 10 1903 bug, it sends every fido2 request/response twice
 			// Everything happens twice, and the computer only pays attention to the 2nd request/response.
 			// This means we can't wipe the response after it's retrieved, have to wipe
 			// based on a timer
 			//memset(large_resp_buffer, 0, LARGE_RESP_BUFFER_SIZE);
-			wipedata(); // Wipe timer started
-			pending_operation=CTAP2_ERR_DATA_WIPE;
+			wipedata(); // Wipe timer started/extended while chunks remain
+			if (large_resp_buffer_cursor >= large_resp_buffer_offset) {
+				pending_operation=CTAP2_ERR_DATA_WIPE;
+				large_resp_buffer_cursor = 0;
+				large_resp_buffer_last_opt3 = 0;
+			}
 		} else if (CRYPTO_AUTH || packet_buffer_offset) {
 			#ifdef DEBUG
 			Serial.println("Ping success");

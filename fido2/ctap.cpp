@@ -1330,12 +1330,29 @@ uint8_t ctap_end_get_assertion(CborEncoder * map, CTAP_credentialDescriptor * cr
 	// OnlyKey required change start
     if ( extend_fido2(&cred->credential.id, &cred->type, sigder) )
     {
-        extern int large_resp_buffer_offset;
         extern uint8_t pending_operation;
-        if ((pending_operation==CTAP2_ERR_DATA_READY || pending_operation==CTAP2_ERR_DATA_WIPE) && large_resp_buffer_offset+1< sizeof(sigder)) {
-            sigder_sz=large_resp_buffer_offset+1;
+        // Size the response from what extension_writeback() ACTUALLY wrote
+        // into sigder, not from large_resp_buffer_offset.
+        //
+        // large_resp_buffer_offset is the length of the whole stored response,
+        // which is not the same thing once send_stored_response() serves a
+        // response in chunks. Using it had two consequences: a response of 513
+        // bytes or more failed the bounds test and fell to the 72-byte default
+        // whatever had been written, and a chunk that did fit was reported at
+        // the full length, so the CBOR byte string ran past the bytes actually
+        // present. That is why a 3309-byte ML-DSA-65 signature came back as 72
+        // bytes regardless of LARGE_RESP_BUFFER_SIZE - the buffer was never the
+        // binding constraint, and the chunking in ok_extension.cpp was inert by
+        // construction.
+        //
+        // extensions.cpp's output_buffer_offset is exactly that count, already
+        // a non-static global. extend_fido2() puts a status byte at output[0]
+        // and the payload from output+1, hence the +1.
+        extern uint16_t output_buffer_offset;
+        if ((pending_operation==CTAP2_ERR_DATA_READY || pending_operation==CTAP2_ERR_DATA_WIPE) && output_buffer_offset+1 < sizeof(sigder)) {
+            sigder_sz=output_buffer_offset+1;
             printf1(TAG_GA,"sigder");
-            dump_hex1(TAG_GA, sigder,large_resp_buffer_offset);
+            dump_hex1(TAG_GA, sigder, output_buffer_offset);
         } else sigder_sz = 72;
     // OnlyKey required change end
     }

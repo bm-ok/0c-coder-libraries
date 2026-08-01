@@ -100,10 +100,20 @@ extern uint8_t* large_resp_buffer;
 extern int large_resp_buffer_offset;
 extern int large_resp_buffer_cursor;
 extern uint8_t large_resp_buffer_last_opt3;
-// Max bytes of large_resp_buffer served per WebAuthn round trip. The real
-// destination is ctap.cpp's sigder[514] minus a status byte, i.e. 513 B -
-// stay safely under it.
-#define MAX_LARGE_RESP_CHUNK 500
+// Max bytes of large_resp_buffer served per WebAuthn round trip.
+//
+// The destination is ctap.cpp's sigder[514]: extend_fido2() puts a status byte
+// at sigder[0] and the payload from sigder+1, and ctap_end_get_assertion()
+// requires sigder_sz (= payload + 1) to be strictly less than sizeof(sigder).
+// So the largest payload that survives is 512, not 513 - at 513 the size test
+// fails and the response silently drops to the 72-byte default.
+//
+// 512 is also exactly an RSA-4096 signature, which keeps the classic PGP path
+// single-shot. That matters because that path cannot reassemble: onlykey-pgp.js's
+// doPinTimer() resolves on the first poll returning an array. Only responses
+// genuinely larger than one assertion (ML-DSA-65's 3309 bytes) chunk, and only
+// callers that accumulate should ask for them.
+#define MAX_LARGE_RESP_CHUNK 512
 extern uint8_t profilemode;
 extern uint8_t isfade;
 extern uint8_t NEO_Color;

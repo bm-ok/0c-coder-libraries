@@ -121,7 +121,7 @@ int Profile_Offset = 0;
 // Parts of some libraries required for international travel edition 
 // not including full libraries as those libraries include crypto 
 
-#define CTAPHID_BUFFER_SIZE         7609
+#define CTAPHID_BUFFER_SIZE         6585
 #define CTAP2_ERR_NO_OPERATION_PENDING      0x2A
 #define CTAP2_ERR_USER_ACTION_PENDING       0x23
 #define CTAP2_ERR_DATA_READY                0xF6
@@ -254,8 +254,16 @@ int large_resp_buffer_offset;
 
 uint8_t ctap_buffer[CTAPHID_BUFFER_SIZE];
 // Reuse ctap_buffer as it uses 7K of RAM
-uint8_t *large_resp_buffer = ctap_buffer + CTAPHID_BUFFER_SIZE - LARGE_RESP_BUFFER_SIZE;				// Last 1024 bytes used to store temp data
-uint8_t *large_buffer = ctap_buffer + CTAPHID_BUFFER_SIZE - LARGE_RESP_BUFFER_SIZE - LARGE_BUFFER_SIZE; // Next 1024 bytes used to store temp data
+// RAM-NEUTRAL decoupling test: large_resp_buffer gets its own array, and
+// ctap_buffer shrinks by exactly the 1024 bytes it used to lend - so total
+// globals are unchanged (30,540). The previous attempt kept ctap_buffer at 7609
+// and so silently added 1KB, which is why it could not separate "the overlay is
+// depended on" from "the stack has under 1KB of headroom".
+// large_buffer keeps its original absolute address: 6585 - 1120 = 5465, the same
+// as the old 7609 - 1024 - 1120, so the X-Wing scratch at 0..3584 stays clear.
+uint8_t large_resp_buffer_store[LARGE_RESP_BUFFER_SIZE];
+uint8_t *large_resp_buffer = large_resp_buffer_store;
+uint8_t *large_buffer = ctap_buffer + CTAPHID_BUFFER_SIZE - LARGE_BUFFER_SIZE;
 // Tracks how much of large_resp_buffer has been delivered, for the chunked
 // retrieval in send_stored_response() (ok_extension.cpp). Must be reset
 // wherever large_resp_buffer_offset is - it indexes into that buffer.
@@ -5767,6 +5775,7 @@ bool wipebuffersafter5sec(Task *me)
 void wipetasks() {
 	packet_buffer_offset = 0;
 	memset(ctap_buffer, 0, CTAPHID_BUFFER_SIZE);
+	memset(large_resp_buffer, 0, LARGE_RESP_BUFFER_SIZE);
 	memset(keyboard_buffer, 0, KEYBOARD_BUFFER_SIZE);
 	memset(packet_buffer_details, 0, sizeof(packet_buffer_details));
 	setBuffer[7] = 0;

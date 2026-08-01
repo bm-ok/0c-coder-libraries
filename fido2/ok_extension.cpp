@@ -128,6 +128,33 @@ extern int packet_buffer_offset;
 extern uint8_t packet_buffer_details[5];
 uint8_t transit_key[32];
 
+// Duplicate-packet suppression high-water mark for inbound OKDECRYPT/OKSIGN
+// requests (the Windows 10 1903 double-fire guard).
+//
+// This used to be kept in packet_buffer_details[3] - which okcore.cpp's
+// process_packets() overwrites with TWO RANDOM BYTES the moment a message
+// completes:
+//
+//     RNG2(packet_buffer_details + 3, 2);   // response channel id
+//
+// Two unrelated meanings on one byte, and the random one wins. The next
+// multi-chunk request then arrives against a random 0-255 threshold, so its
+// early chunks fail `opt3 <= last` and are dropped SILENTLY - no error, no
+// print. The device accumulates only the chunks that happened to exceed the
+// random byte, hashes that short buffer, and asks for challenge digits
+// computed over bytes the host never sent.
+//
+// Measured 2026-08-01: a 1088-byte ML-KEM-768 ciphertext sent as five
+// 228-byte chunks arrived as its final 176-byte chunk ALONE (1088 - 4*228),
+// confirmed by the "Received Message" byteprint, and every confirmation
+// failed with "Error incorrect challenge was entered".
+//
+// This affects the classic RSA path identically - any payload needing more
+// than one keyhandle. It goes unnoticed there because wipetasks() zeroes the
+// byte on a 5s timer, and a human operating the web app usually takes longer
+// than that between operations; a scripted caller does not.
+static uint8_t last_request_opt3 = 0;
+
 
 int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint8_t * output) {
     int8_t ret = 0;
@@ -403,8 +430,8 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 			// Break the FIDO message into packets
 			else if (!CRYPTO_AUTH) {
 				int i=0;
-				if (!packet_buffer_details[3]) packet_buffer_details[3] = opt3; // first packet
-				else if (opt3 <= packet_buffer_details[3]) return 0; // duplicate packet, thanks to win 10 1903 sending all FIDO2 messages twice
+				if (!last_request_opt3) last_request_opt3 = opt3; // first packet
+				else if (opt3 <= last_request_opt3) return 0; // duplicate packet, thanks to win 10 1903 sending all FIDO2 messages twice
 
 				while(handle_len>0) { // Max size packet minus header
 					memset(recv_buffer, 0, sizeof(recv_buffer));
@@ -416,7 +443,7 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 					recv_buffer[6] = 0xFF;
 					if (opt2 && handle_len<=57) recv_buffer[6] = handle_len; // last packet
 					if (cmd == OKDECRYPT) {
-						packet_buffer_details[3] = opt3;
+						last_request_opt3 = opt3;
 						NEO_Color = 128; //Turquoise
 						large_buffer_offset = 0;
 						outputmode=WEBAUTHN;
@@ -426,7 +453,7 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 						#endif
 						okcrypto_decrypt(recv_buffer);
 					} else if (cmd == OKSIGN) {
-						packet_buffer_details[3] = opt3;
+						last_request_opt3 = opt3;
 						NEO_Color = 213; //Purple
 						large_buffer_offset = 0;
 						outputmode=WEBAUTHN;
@@ -439,6 +466,9 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 					handle_len-=57;
 					i++;
 				}
+				// opt2 marked this the final chunk, so the message is complete
+				// and the next one must start from a clean high-water mark.
+				if (opt2) last_request_opt3 = 0;
 				ret = 0;
 				}
 		}

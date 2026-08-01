@@ -121,7 +121,7 @@ extern "C"
 /*************************************/
 //Global Buffer Sizes
 /*************************************/
-#define LARGE_RESP_BUFFER_SIZE         1024
+#define LARGE_RESP_BUFFER_SIZE         3328
 #define LARGE_BUFFER_SIZE         1120
 #define PACKET_BUFFER_SIZE         1120
 #define ATTESTATION_DER_BUFFER_SIZE 768

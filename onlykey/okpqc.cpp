@@ -74,6 +74,7 @@ extern "C" {
   void okcore_aes_gcm_decrypt(uint8_t *state, uint8_t slot, uint8_t features, uint8_t *key, int len);
   void send_transport_response(uint8_t *data, int len, bool enc, bool storeread);
   void hidprint(const char *s);
+  void byteprint(uint8_t *bytes, int size);
   void fadeoff(int);
 }
 
@@ -146,6 +147,61 @@ void okpqc_sign(uint8_t *buffer)
     uint8_t  sel = large_buffer[0];
     uint8_t *msg = large_buffer + 1;
     size_t   msglen = (large_buffer_offset > 0) ? (size_t)(large_buffer_offset - 1) : 0;
+
+    /* Selector 2: return the ML-DSA-65 public key this device derives from the
+     * stored seed, instead of a signature.
+     *
+     * The host cannot otherwise see it - okcrypto_getpubkey() has no
+     * KEYTYPE_PQC_PGP branch - and without it "the signature does not verify"
+     * cannot be split into "wrong key material" versus "wrong message
+     * representative". Reading it over the DEBUG channel was tried first and
+     * does not work: ML-DSA keygen floods the serial trace and the prints are
+     * dropped (QUIRKS.md). This uses the same proven chunked response path the
+     * signature itself uses.
+     *
+     * Costs nothing at rest and is genuinely useful beyond debugging - it lets
+     * a host confirm which key a slot actually holds. */
+    if (sel == PQC_HALF_PQC_PUBKEY) {
+        uint8_t pk[MLDSA_PK_SIZE];
+        int rc = PQCP_MLDSA_NATIVE_MLDSA65_keypair_internal(pk, pqc_expanded_sk,
+                                                            rsa_private_key + PQC_OFF_MLDSA_SEED);
+        memset(pqc_expanded_sk, 0, sizeof pqc_expanded_sk);
+        memset(large_buffer, 0, LARGE_BUFFER_SIZE);
+        if (rc != 0) { pending_operation = 0; hidprint("Error ML-DSA keygen"); return; }
+        pending_operation = CTAP2_ERR_DATA_READY;
+        /* Send only rho, the first 32 bytes. The whole 1952-byte key cannot be
+         * returned: store_FIDO_response() drops anything >= LARGE_RESP_BUFFER_SIZE
+         * (1024) and does so SILENTLY, so the readback staged nothing and every
+         * poll answered "Error incorrect challenge was entered" - its
+         * nothing-is-staged message - which reads as a rejected challenge.
+         * rho = H(xi || k || l)[0:32] is enough to compare derivations: it
+         * differs whenever the seed or the expansion differs. */
+        send_transport_response(pk, 32, false, true);
+        fadeoff(85);
+        return;
+    }
+
+    /* DEBUG-ONLY. Hands back the stored ML-DSA seed itself.
+     *
+     * The device derives an ML-DSA public key that matches neither the host's
+     * derivation from the same blob nor ANY 32-byte window of that blob, while
+     * the Ed25519 half of the same blob verifies and both decrypt halves round
+     * trip. That combination leaves exactly two possibilities - the seed the
+     * device stored is not the seed the host sent, or keypair_internal()
+     * disagrees with FIPS 204 - and nothing observable from outside separates
+     * them. This does.
+     *
+     * Guarded so it cannot reach a production build: it exports private key
+     * material by design. */
+#ifdef DEBUG
+    if (sel == PQC_HALF_PQC_SEED) {
+        pending_operation = CTAP2_ERR_DATA_READY;
+        memset(large_buffer, 0, LARGE_BUFFER_SIZE);
+        send_transport_response(rsa_private_key + PQC_OFF_MLDSA_SEED, 32, false, true);
+        fadeoff(85);
+        return;
+    }
+#endif
 
     if (sel == PQC_HALF_ECC) {                           /* Ed25519 */
         uint8_t sig[ED25519_SIG_SIZE];

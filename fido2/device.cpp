@@ -120,17 +120,38 @@ int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
 
 void store_FIDO_response (uint8_t *data, int len, uint8_t encrypt) {
     cancelfadeoffafter20();
-  if (len >= (int)LARGE_RESP_BUFFER_SIZE) return; //Double check buf overflow
+  if (len >= (int)LARGE_RESP_BUFFER_SIZE) {
+    // Was a bare `return`. A response too large to stage then vanished with no
+    // error anywhere, and the next OKPING - finding nothing staged and
+    // CRYPTO_AUTH cleared by the completed operation - answered "Error
+    // incorrect challenge was entered", about a challenge that had in fact
+    // been entered correctly. Say what actually happened instead.
+    hidprint("Error response too large to store");
+    return;
+  }
 	if (encrypt==1) {
 		okcrypto_aes_crypto_box (data, len, false);
 	} else if (encrypt==2) {
-		okcrypto_aes_crypto_box (data+32, len-32, false); // Don't encrypt pubkey 
+		okcrypto_aes_crypto_box (data+32, len-32, false); // Don't encrypt pubkey
 	} else {
     // Unencrypted message, check if it's an error message
     if (strcmp((char*)data, "Error")) {
-      memset(large_resp_buffer, 0, LARGE_RESP_BUFFER_SIZE);
+      // `data` may BE large_resp_buffer: okpqc_decrypt() writes each half's
+      // 32-byte shared secret there and then calls send_transport_response()
+      // on it. Clearing the whole buffer here erased the very bytes the
+      // memmove below was about to copy, so the copy moved zeros onto zeros.
+      // Measured 2026-08-01: a correct X25519 shared secret reached the host
+      // as 32 zero bytes, with no error on either side. Clear only the region
+      // that is not the payload.
+      if (data >= large_resp_buffer && data < large_resp_buffer + LARGE_RESP_BUFFER_SIZE) {
+        int used = (int)(data - large_resp_buffer) + len;
+        memset(large_resp_buffer, 0, (int)(data - large_resp_buffer));
+        memset(large_resp_buffer + used, 0, LARGE_RESP_BUFFER_SIZE - used);
+      } else {
+        memset(large_resp_buffer, 0, LARGE_RESP_BUFFER_SIZE);
+      }
       CRYPTO_AUTH = 0;
-    } 
+    }
   }
   large_resp_buffer_offset = len;
 

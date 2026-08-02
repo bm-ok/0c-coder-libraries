@@ -77,6 +77,14 @@ int16_t bridge_u2f_to_solo(uint8_t * _appid, uint8_t * output, uint8_t * keyh, i
        case OKSIGN:
        //case OKGETPUBKEY:
        case OKCONNECT:
+          // Every OnlyKey reply is written through extension_writeback(), and
+          // send_stored_response() re-declares the size each time it has a chunk
+          // to hand back. Declaring 0 here means "nothing written yet", which is
+          // what lets ctap_end_get_assertion() tell a served chunk apart from a
+          // poll that found nothing - see the sizing comment there. The 71 above
+          // stays correct for the Wallet operations, which write into `output`
+          // directly instead of through extension_writeback().
+          extension_writeback_init(output, 0);
           return bridge_to_onlykey(_appid, keyh, keylen, output);
 
 #endif

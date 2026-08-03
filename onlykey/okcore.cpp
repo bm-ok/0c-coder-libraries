@@ -2335,12 +2335,167 @@ void fadeout()
 }
 
 #ifdef DEBUG
-int lastIncomingSerialByte = 0;
-// 0 = no wipe armed, 1 = userspace-only wipe armed ('0'), 2 = full wipe armed ('9')
-uint8_t wipeConfirmPending = 0;
-#define WIPE_PENDING_NONE 0
-#define WIPE_PENDING_USERSPACE 1
-#define WIPE_PENDING_FULL 2
+// Line buffer and press queue for the DEBUG serial protocol - see the parser in
+// touch_sense_loop() below for the grammar. Bytes accumulate here one per loop()
+// iteration and are acted on when a terminator arrives.
+// One SEREMU OUT report (SEREMU_RX_SIZE, usb_desc.h) is 32 bytes, so that is
+// what the host can deliver in a single write - sizing the line buffer to match
+// means any line the transport can carry in one report is also one the parser
+// will accept. The queue is sized so a full-length PIN (the firmware's own
+// limit is 10 digits) fits in one line without the caller splitting it.
+#define DBG_LINE_MAX 32   //raw bytes accepted before the terminator
+#define DBG_QUEUE_MAX 16  //decoded press events held for replay
+
+// Press durations, in the units payload() (OnlyKey.ino) compares against. The
+// bands that matter there: <=20 tap, >=72 hold actions, >=140 key labels,
+// >=180 DUO config mode, >=360 DUO factory default. A single fixed 128 used to
+// be the only hold available here, leaving everything from 140 up unreachable.
+#define DBG_PRESS_TAP 1
+#define DBG_PRESS_HOLD 128       //'!'   - a plain hold, the >=72 actions
+#define DBG_PRESS_HOLD_LONG 200  //'!!'  - clears the >=180 band
+#define DBG_PRESS_HOLD_MAX 400   //'!!!' - clears the >=360 band
+#define DBG_PRESS_MAX 1000       //ceiling for the explicit '#<ticks>' form
+
+static char dbgLine[DBG_LINE_MAX];
+static uint8_t dbgLineLen = 0;
+static bool dbgLineOverflow = false;
+
+static int dbgQueueButton[DBG_QUEUE_MAX];
+static int dbgQueueDuration[DBG_QUEUE_MAX];
+static uint8_t dbgQueueLen = 0;   //slots filled
+static uint8_t dbgQueueNext = 0;  //slots already replayed
+
+// Reclaims the slots already replayed, so a queue that has been partly drained
+// still accepts a full line rather than reporting itself full at the tail.
+static void dbg_queue_compact () {
+	if (!dbgQueueNext) return;
+	for (uint8_t i = dbgQueueNext; i < dbgQueueLen; i++) {
+		dbgQueueButton[i - dbgQueueNext] = dbgQueueButton[i];
+		dbgQueueDuration[i - dbgQueueNext] = dbgQueueDuration[i];
+	}
+	dbgQueueLen -= dbgQueueNext;
+	dbgQueueNext = 0;
+}
+
+// Decodes a line whose first byte is a button digit into queued press events.
+// Tokens are self-delimiting - a digit opens one, '!' or '#<ticks>' modifies the
+// digit before it - so no separator byte is needed and space stays free to mean
+// what the pre-existing clients use it for.
+static void dbg_run_presses () {
+	dbg_queue_compact();
+
+	uint8_t queuedBefore = dbgQueueLen;
+	uint8_t i = 0;
+
+	while (i < dbgLineLen) {
+		char c = dbgLine[i++];
+		if (c < '1' || c > '6') {
+			Serial.print("DEBUG: '");
+			Serial.print(c);
+			Serial.println("' is not a button 1-6, press line ignored");
+			dbgQueueLen = queuedBefore; //roll back, so a bad line presses nothing
+			return;
+		}
+
+		int duration = DBG_PRESS_TAP;
+		if (i < dbgLineLen && dbgLine[i] == '#') { //explicit duration in ticks
+			i++;
+			int ticks = 0;
+			uint8_t digits = 0;
+			while (i < dbgLineLen && dbgLine[i] >= '0' && dbgLine[i] <= '9') {
+				if (ticks <= DBG_PRESS_MAX) ticks = (ticks * 10) + (dbgLine[i] - '0');
+				i++;
+				digits++;
+			}
+			if (!digits || ticks < 1) {
+				Serial.println("DEBUG: '#' needs a duration in ticks, press line ignored");
+				dbgQueueLen = queuedBefore;
+				return;
+			}
+			duration = ticks > DBG_PRESS_MAX ? DBG_PRESS_MAX : ticks;
+		} else { //'!' per hold tier
+			uint8_t holds = 0;
+			while (i < dbgLineLen && dbgLine[i] == '!') {
+				holds++;
+				i++;
+			}
+			if (holds == 1) duration = DBG_PRESS_HOLD;
+			else if (holds == 2) duration = DBG_PRESS_HOLD_LONG;
+			else if (holds >= 3) duration = DBG_PRESS_HOLD_MAX;
+		}
+
+		if (dbgQueueLen >= DBG_QUEUE_MAX) {
+			Serial.println("DEBUG: press queue full, remaining presses on this line dropped");
+			break;
+		}
+		dbgQueueButton[dbgQueueLen] = c;
+		dbgQueueDuration[dbgQueueLen] = duration;
+		dbgQueueLen++;
+	}
+}
+
+// True when the buffered line is exactly `path`.
+static bool dbg_line_is (const char *path) {
+	uint8_t i = 0;
+	while (path[i]) {
+		if (i >= dbgLineLen || dbgLine[i] != path[i]) return false;
+		i++;
+	}
+	return i == dbgLineLen;
+}
+
+// Decodes a line that is not a press as a command path: each byte selects a
+// deeper node, so a destructive command is only reachable by spelling out the
+// whole path in one line and no single stray byte can trigger one.
+static void dbg_run_command () {
+	if (dbg_line_is("8")) { //restart, no data touched
+		Serial.println("DEBUG: '8' restart requested, restarting now...");
+		CPU_RESTART(); //does not return
+		return;
+	}
+
+	// The trailing 'C' is the confirmation: a wipe needs its whole path in one
+	// line, so no single stray byte can reach one and no separate arm/confirm
+	// handshake (and the state it needed) has to be carried between lines.
+	if (dbg_line_is("0C")) {
+		Serial.println("DEBUG: '0C' confirmation received, wiping userspace only...");
+		wipeuserspace(); //wipes PIN/profile/slot data only, does NOT touch firmware; restarts, does not return
+		return;
+	}
+	if (dbg_line_is("9C")) {
+		Serial.println("DEBUG: '9C' confirmation received, performing full wipe (firmware + userspace)...");
+		factorydefault(); //wipes EEPROM+flash+firmware hash and restarts, does not return
+		return;
+	}
+
+	// Unrecognised path, deliberately silent beyond the echo the caller already
+	// got: this is the readiness-probe path (clients ping with a byte the
+	// firmware ignores) and it runs often enough that a print per probe would
+	// add avoidable noise to a channel already known to drop output under load.
+}
+
+// Acts on a completed line and empties the buffer.
+static void dbg_commit_line () {
+	if (dbgLineOverflow) {
+		Serial.println("DEBUG: input line longer than 32 bytes, ignored");
+		dbgLineLen = 0;
+		dbgLineOverflow = false;
+		return;
+	}
+	if (!dbgLineLen) return; //bare terminator, nothing to act on
+
+	// One echo per completed line, carrying its first byte - the button for a
+	// press line, the command for a path. Clients use this both as a
+	// per-line acknowledgement and as the "firmware is running loop()"
+	// readiness probe, so it is printed before the line is acted on.
+	Serial.print("I received from DEBUG: ");
+	Serial.println((int)(uint8_t)dbgLine[0], DEC);
+
+	if (dbgLine[0] >= '1' && dbgLine[0] <= '6') dbg_run_presses();
+	else dbg_run_command();
+
+	dbgLineLen = 0;
+}
 #endif
 
 int touch_sense_loop () {
@@ -2474,94 +2629,71 @@ int touch_sense_loop () {
 	}
 
 	#ifdef DEBUG
-	// Simulated button presses for controlled testing, sent as ASCII digits '1'-'6'
-	// over the Serial (SEREMU) channel, terminated by return (short press) or space (long press).
-	// '0' and '9' are not real buttons - they are debug-only commands that wipe the device back
-	// to a clean, unconfigured state. Both require the space (long-press) terminator, same as
-	// physical destructive-action holds, PLUS a second explicit 'C' confirmation (also
-	// long-press-terminated) before anything actually wipes, so it can't be triggered by a
-	// single accidental "0 " or "9 ":
-	//   '0' then 'C' -> userspace-only wipe (PIN/profile/slot data - wipeuserspace(), no reflash needed)
-	//   '9' then 'C' -> full wipe (also erases the firmware hash and forces the bootloader - factorydefault())
-	// '8' is a separate debug-only command that just restarts the device (CPU_RESTART()) -
-	// no data is touched, so no confirmation step is needed. Needed because completing PIN
-	// setup via the bare OKPIN/OKPINSEC/OKPINSD HID messages (as OnlyKeyWizard.js does)
-	// commits flash state but does not itself reboot - only the physical-button-driven
-	// okcore_quick_setup() flow reaches the CPU_RESTART() at the end of backup-passphrase
-	// generation. 'initialized' is only recomputed from flash at boot (OnlyKey.ino setup()),
-	// so a restart is required before a freshly-set PIN shows up as INITIALIZED.
+	// Simulated button presses and debug commands for controlled testing, sent over the
+	// Serial (SEREMU) channel. Bytes accumulate into a line buffer and are acted on when a
+	// terminator arrives; return ('\n') is the terminator, and the line is zeroed after it.
+	//
+	// A line starting with '1'-'6' is a sequence of button presses, replayed one per loop()
+	// iteration. Tokens are self-delimiting, so a whole PIN attempt fits on one line and the
+	// caller does not have to pace the presses itself:
+	//   "1"       -> tap button 1
+	//   "1!"      -> hold (duration 128) - the tier the old space terminator produced
+	//   "1!!"     -> long hold (200), reaches payload()'s >=180 actions
+	//   "1!!!"    -> longest hold (400), reaches the >=360 DUO factory-default action
+	//   "1#250"   -> exact duration in ticks, for testing a specific band boundary
+	//   "1234567" -> seven taps, in order
+	//
+	// Any other line is a command path: each byte selects a deeper node, so a destructive
+	// command is only reachable by spelling out the whole path in a single line and no stray
+	// byte can trigger one. '0' and '9' are not buttons - they wipe the device back to a
+	// clean, unconfigured state, and the trailing 'C' is their confirmation:
+	//   "0C" -> userspace-only wipe (PIN/profile/slot data - wipeuserspace(), no reflash needed)
+	//   "9C" -> full wipe (also erases the firmware hash and forces the bootloader - factorydefault())
+	//   "8"  -> restart only (CPU_RESTART()), no data touched, so nothing to confirm. Needed
+	//           because completing PIN setup via the bare OKPIN/OKPINSEC/OKPINSD HID messages
+	//           (as OnlyKeyWizard.js does) commits flash state but does not itself reboot -
+	//           only the physical-button-driven okcore_quick_setup() flow reaches the
+	//           CPU_RESTART() at the end of backup-passphrase generation. 'initialized' is
+	//           only recomputed from flash at boot (OnlyKey.ino setup()), so a restart is
+	//           required before a freshly-set PIN shows up as INITIALIZED.
+	// An unrecognised path does nothing at all beyond the echo, which is what makes it
+	// usable as a readiness probe.
+	//
+	// Return is the only terminator. Space used to be a second one meaning "long press",
+	// which made it unusable as ordinary input and clashed with clients that line-buffer;
+	// it is now rejected with a message rather than silently ignored, so a caller still
+	// sending the old form finds out immediately instead of seeing its presses vanish.
 	if (Serial.available() > 0) { //if we have any data in the Serial input
 	    int incomingByte = Serial.read(); //trim off the first byte off Serial input buffer
 
-	    if (incomingByte == 10 || incomingByte == 32) { //return or space
-		Serial.print("I received from DEBUG: ");
-		Serial.println(lastIncomingSerialByte, DEC);
+	    if (incomingByte == 10) { //return terminates and commits the line
+		dbg_commit_line();
+	    } else if (incomingByte == 32 || incomingByte == 9) { //space or tab
+		Serial.println("DEBUG: space is no longer a terminator - end the line with return, and use '!' for a hold");
+		dbgLineLen = 0;
+		dbgLineOverflow = false;
+	    } else if (incomingByte != 13 && incomingByte != 0) {
+		// CR is ignored so a client sending CRLF still works. NUL is ignored
+		// because this arrives over a fixed-size HID report (SEREMU_RX_SIZE
+		// is 32 bytes): the host writes a short line and the transport pads
+		// the rest with zeros, so every line is followed by padding that is
+		// not input.
+		if (dbgLineLen < DBG_LINE_MAX) dbgLine[dbgLineLen++] = (char)incomingByte;
+		else dbgLineOverflow = true; //resyncs at the next terminator
+	    }
+	}
 
-		if (lastIncomingSerialByte == 48) { //0 - DEBUG-only userspace wipe/reset command
-			if (incomingByte == 32) { //require long-press (space) terminator
-				wipeConfirmPending = WIPE_PENDING_USERSPACE;
-				Serial.println("DEBUG: '0' userspace wipe requested - send 'C' (long-press) to confirm, or anything else to cancel");
-			} else {
-				Serial.println("DEBUG: '0' reset command ignored, hold with space (long-press) to confirm");
-			}
-			lastIncomingSerialByte = incomingByte;
-			return 0;
-		} else if (lastIncomingSerialByte == 57) { //9 - DEBUG-only full wipe command (firmware + userspace)
-			if (incomingByte == 32) { //require long-press (space) terminator
-				wipeConfirmPending = WIPE_PENDING_FULL;
-				Serial.println("DEBUG: '9' full wipe requested - send 'C' (long-press) to confirm, or anything else to cancel");
-			} else {
-				Serial.println("DEBUG: '9' reset command ignored, hold with space (long-press) to confirm");
-			}
-			lastIncomingSerialByte = incomingByte;
-			return 0;
-		} else if (lastIncomingSerialByte == 56) { //8 - DEBUG-only restart command, no data touched
-			Serial.println("DEBUG: '8' restart requested, restarting now...");
-			CPU_RESTART(); //does not return
-			return 0;
-		} else if (lastIncomingSerialByte == 67) { //C - confirms a pending '0' or '9' wipe
-			if (wipeConfirmPending != WIPE_PENDING_NONE && incomingByte == 32) { //require long-press (space) terminator
-				uint8_t confirmedWipe = wipeConfirmPending;
-				wipeConfirmPending = WIPE_PENDING_NONE;
-				if (confirmedWipe == WIPE_PENDING_FULL) {
-					Serial.println("DEBUG: 'C' confirmation received, performing full wipe (firmware + userspace)...");
-					factorydefault(); //wipes EEPROM+flash+firmware hash and restarts, does not return
-				} else {
-					Serial.println("DEBUG: 'C' confirmation received, wiping userspace only...");
-					wipeuserspace(); //wipes PIN/profile/slot data only, does NOT touch firmware; restarts, does not return
-				}
-			} else if (wipeConfirmPending != WIPE_PENDING_NONE) {
-				Serial.println("DEBUG: 'C' confirmation ignored, hold with space (long-press) to confirm");
-			} else {
-				Serial.println("DEBUG: 'C' received but no '0'/'9' reset is pending, ignoring");
-			}
-			lastIncomingSerialByte = incomingByte;
-			return 0;
+	// Replay one queued press per loop iteration. Pacing them here rather than on the host is
+	// what lets a multi-press line arrive in one write, and it matches the rate the physical
+	// button path feeds presses in at.
+	if (key_press == 0 && dbgQueueNext < dbgQueueLen) {
+		button_selected = dbgQueueButton[dbgQueueNext];
+		key_press = dbgQueueDuration[dbgQueueNext];
+		dbgQueueNext++;
+		if (dbgQueueNext >= dbgQueueLen) { //fully drained, start the next line at the front
+			dbgQueueNext = 0;
+			dbgQueueLen = 0;
 		}
-		wipeConfirmPending = WIPE_PENDING_NONE; //any other command cancels a pending wipe confirmation
-		if (lastIncomingSerialByte == 49) { //1
-			button_selected = '1';
-			key_press = 1;
-		} else if (lastIncomingSerialByte == 50) { //2
-			button_selected = '2';
-			key_press = 1;
-		} else if (lastIncomingSerialByte == 51) { //3
-			button_selected = '3';
-			key_press = 1;
-		} else if (lastIncomingSerialByte == 52) { //4
-			button_selected = '4';
-			key_press = 1;
-		} else if (lastIncomingSerialByte == 53) { //5
-			button_selected = '5';
-			key_press = 1;
-		} else if (lastIncomingSerialByte == 54) { //6
-			button_selected = '6';
-			key_press = 1;
-	    	}
-	    	if (key_press == 1 && incomingByte == 32) //space
-	    		key_press = 128; //make it long press
-		}
-	    lastIncomingSerialByte = incomingByte; //save the byte for next loop
 	}
 	#endif
 

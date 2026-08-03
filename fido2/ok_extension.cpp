@@ -545,8 +545,12 @@ int16_t send_stored_response(uint8_t * output, uint8_t opt3) {
       		ret = CTAP2_ERR_NO_OPERATION_PENDING;
 			fadeoff(1);
 		}
-		return ret; 
+		return ret;
 	}
+	// The whole body above is inside `if (profilemode != NONENCRYPTEDPROFILE)`,
+	// so a non-encrypted profile falls off the end of a non-void function. ret
+	// is still 0 on that path, which is what the inner return would produce.
+	return ret;
 }
 
 #endif

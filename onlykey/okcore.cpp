@@ -851,7 +851,12 @@ void set_built_in_pin() {
 	pin_set = 3;
 	// 19-35 bytes of chip ID used instead of primary PIN
 	set_primary_pin((uint8_t*)recv_buffer, KEYBOARD_AUTO_PIN_SET);
-	okeeprom_eeset_timeout(0); // No timeout as there is no PIN required
+	// okeeprom_eeset_timeout() takes a uint8_t*, and okeeprom_eeset_common()
+	// dereferences it. Passing 0 is a null POINTER, not the value zero; it only
+	// stores zero here because address 0 on the MK20DX256 is the vector table's
+	// initial stack pointer, whose first byte little-endian is 0x00.
+	uint8_t no_timeout = 0;
+	okeeprom_eeset_timeout(&no_timeout); // No timeout as there is no PIN required
 	initcheck = okcore_flashget_noncehash ((uint8_t*)nonce, 32); 
 	okcore_flashget_pinhashpublic ((uint8_t*)p1hash, 32); //store PIN hash
     initialized = true;
@@ -2895,6 +2900,9 @@ void keytype(char const *chars)
 void byteprint(uint8_t *bytes, int size)
 {
 #ifdef DEBUG
+	// Callers hand this null freely - webcryptcheck() does byteprint(_appid, 32)
+	// on a path where ctap_filter_invalid_credentials() passed no appid at all.
+	if (!bytes) return;
 	Serial.println();
 	for (int i = 0; i < size; i++)
 	{
@@ -2944,7 +2952,15 @@ void factorydefault()
 			eeprom_write_byte((unsigned char *)i, 0);
 		}
 #ifdef DEBUG
+#ifdef OK_EMULATOR
+		// Page zero is deliberately left unmapped on a hosted build (mapping it
+		// would need vm.mmap_min_addr=0, removing NULL-dereference protection
+		// machine-wide). Start at the first mapped flash page instead - this is
+		// diagnostic output only and nothing depends on its contents.
+		uintptr_t adr = 0x1000;
+#else
 		uintptr_t adr = 0x0;
+#endif
 		for (int i = 0; i < 65536; i += 4)
 		{
 			Serial.println(adr, HEX);
@@ -3035,8 +3051,15 @@ void wipeflashdata()
 
 
 /*************************************/
-void okcore_flashget_common(uint8_t *ptr, unsigned long *adr, int len)
+/*
+ * Walk flash one 32-bit word per iteration, matching the `z = z + 4` stride
+ * over the byte buffer. `unsigned long` is the flash word type on this target
+ * but is 8 bytes wherever long is 64-bit, which would step two words at a time
+ * while the field offsets - plain byte arithmetic on uintptr_t - do not double.
+ */
+void okcore_flashget_common(uint8_t *ptr, unsigned long *adr_in, int len)
 {
+	uint32_t *adr = (uint32_t *)adr_in;
 	for (int z = 0; z <= len - 4; z = z + 4)
 	{
 		//Serial.println(" 0x%X", (adr));
@@ -3058,8 +3081,10 @@ void okcore_flashget_common(uint8_t *ptr, unsigned long *adr, int len)
 	return;
 }
 
-void okcore_flashset_common(uint8_t *ptr, unsigned long *adr, int len)
+/* Same 32-bit stride as okcore_flashget_common above. */
+void okcore_flashset_common(uint8_t *ptr, unsigned long *adr_in, int len)
 {
+	uint32_t *adr = (uint32_t *)adr_in;
 	for (int z = 0; z <= len - 4; z = z + 4)
 	{
 		unsigned long data = (uint8_t) * (ptr + z + 3) | ((uint8_t) * (ptr + z + 2) << 8) | ((uint8_t) * (ptr + z + 1) << 16) | ((uint8_t) * (ptr + z) << 24);
@@ -5534,6 +5559,12 @@ int ctap_flash(int index, uint8_t *buffer, int size, uint8_t mode)
 		//hidprint("Successfully set CTAP Value");
 	}
 	#endif
+	// The mode==2 (write resident key) branch above has no return of its own,
+	// and the #endif closes #ifdef STD_VERSION - so a non-STD_VERSION build has
+	// an entirely empty body. Falling off the end of a non-void function is
+	// undefined behaviour; every other branch returns 0 on success, and both
+	// callers of mode 2 (device.cpp, okcore.cpp) discard the result.
+	return 0;
 }
 
 void flash_modify(int index, uint8_t *sector, uint8_t *data, int size, bool wipe)
@@ -7756,23 +7787,31 @@ void okcore_aes_cbc_decrypt (uint8_t * state, const uint8_t * key, int len)
 
 char * HW_MODEL(char const * in) {
 	// HW_MODEL p=OnlyKey DUO with PIN, n=OnlyKey DUO without PIN, c=OnlyKey LQFP or BGA w/dual LEDs, o=Discontinued OnlyKey Orignal
-	char out[strlen(in)+2];
-	memcpy(out,in,strlen(in));
+	// The result is returned to the caller, so it cannot live in this frame:
+	// `char out[strlen(in)+2]` is a VLA that dies with the frame, leaving the
+	// caller reading freed stack. A function-static buffer has the same
+	// single-threaded lifetime the callers already assume - the result is
+	// consumed immediately by hidprint() - and removes the undefined behaviour.
+	// Bounded so a long input cannot overrun.
+	static char out[64];
+	size_t n = strlen(in);
+	if (n > sizeof(out) - 2) n = sizeof(out) - 2;
+	memcpy(out, in, n);
 	#ifdef OK_Color
 	if (onlykeyhw==OK_HW_DUO) {
 		if (Duo_config[0]==1) {
-			out[sizeof(out)-2] = 'n';
+			out[n] = 'n';
 		} else {
-			out[sizeof(out)-2] = 'p';	
+			out[n] = 'p';
 		}
 	} else {
-		out[sizeof(out)-2] = 'c';
+		out[n] = 'c';
 	}
 	#else
-	out[sizeof(out)-2] = 'o';
+	out[n] = 'o';
 	#endif
-	out[sizeof(out)-1] = 0;
-	return (char*)out;
+	out[n + 1] = 0;
+	return out;
 }
 
 void okcore_pin_login ()

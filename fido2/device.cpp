@@ -287,6 +287,11 @@ uint32_t ctap_atomic_count(uint32_t amount)
     } else {
         setCounter(amount+counter1);
     }
+    // The amount != 0 branches above set the counter and then fall off the end
+    // of a non-void function - undefined behaviour. Re-reading is what the
+    // amount == 0 branch effectively returns; the caller in ctaphid.cpp that
+    // passes a non-zero amount ignores the result either way.
+    return getCounter();
 }
 
 void device_manage(void)

@@ -5261,7 +5261,7 @@ int okcore_flashget_ECC(uint8_t slot)
 	return 0;
 }
 
-void ecc_priv_flash(uint8_t *buffer, bool wipe)
+void ecc_priv_flash(uint8_t *buffer, bool wipe, bool quiet)
 {
 
 	if (profilemode == NONENCRYPTEDPROFILE)
@@ -5328,6 +5328,29 @@ void ecc_priv_flash(uint8_t *buffer, bool wipe)
 			// CRYPTO_AUTH==4: confirmed via the 3-button challenge, proceed.
 		}
 		okcrypto_generate_random_key(buffer);
+		if (basetype == KEYTYPE_MLKEM768 || basetype == KEYTYPE_XWING) {
+			// The PQC keygens STORE THE SEED THEMSELVES and must not fall
+			// through to the write below.
+			//
+			// okcrypto_xwing_keygen() (and its ML-KEM twin) generates a 32-byte
+			// seed into buffer+7 and calls back into this function to save it -
+			// that inner call encrypts the seed in place, writes the slot, and
+			// records the key type with its decrypt-feature bit. It then expands
+			// its own plaintext copy of the seed and answers the host with the
+			// public key.
+			//
+			// Falling through here encrypts the ALREADY ENCRYPTED buffer a
+			// second time and writes E(E(seed)) over the slot the inner call
+			// just wrote correctly. The device then holds a key that is not the
+			// one whose public half it just reported: --generate prints one
+			// recipient, --recipient reads back a different one, and anything
+			// encrypted to the first can never be decrypted by anyone.
+			//
+			// Found by the test kit asking the device a second question
+			// (02-cli/01-pqc-keygen), which is also what counts the flash
+			// writes: one keygen must erase the sector once, not twice.
+			return;
+		}
 	}
 #ifdef DEBUG
 	Serial.print("ECC Key value =");
@@ -5363,10 +5386,20 @@ void ecc_priv_flash(uint8_t *buffer, bool wipe)
 	{ //Designated Backup Passphrase slot
 		hidprint("Successfully set Backup Passphrase");
 	}
-	else if (gen_key != 0 && initcheck)
+	else if (gen_key != 0 && initcheck && !quiet)
 	{
+		// `quiet` is the PQC keygens storing their seed.
+		//
+		// This status message goes out as an ordinary transport response, and
+		// okcrypto_xwing_keygen() sends the 1216-byte public key immediately
+		// after it. A host reading 1216 bytes has no way to tell the two apart:
+		// it takes this message as the first 64-byte report of the key, and
+		// ends up with "Successfully set ECC Key", forty zero bytes, and the
+		// real key shifted 64 bytes along - so pk_X falls off the end entirely.
+		// The recipient it then prints is not a key the device has, and
+		// anything encrypted to it is lost.
 		hidprint("Successfully set ECC Key");
-		if (buffer[0] != 0xBA) 
+		if (buffer[0] != 0xBA)
 			blink(2);
 	} else if (wipe) {
 		hidprint("Successfully wiped ECC Key");

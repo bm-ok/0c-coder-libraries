@@ -1866,7 +1866,7 @@ void okcrypto_mlkem_keygen (uint8_t *buffer) {
 	RNG2(buffer + 7, 32);
 	memcpy(seed, buffer + 7, 32); // ecc_priv_flash() below encrypts buffer+7 in place (gcm.encrypt(state,state,len)) - keep the plaintext for the expansion below
 	buffer[6] = (KEYTYPE_MLKEM768 & 0x0F) | 0x20; // type with decrypt feature (bit 5)
-	ecc_priv_flash(buffer, false);
+	ecc_priv_flash(buffer, false, true); // quiet: the public key below IS the response
 
 	// Expand seed to 64-byte coins: SHAKE256(seed, 64)
 	uint8_t coins[64];
@@ -2009,7 +2009,7 @@ void okcrypto_xwing_keygen (uint8_t *buffer) {
 	RNG2(buffer + 7, XWING_SEED_SIZE);
 	memcpy(seed, buffer + 7, XWING_SEED_SIZE); // ecc_priv_flash() below encrypts buffer+7 in place (gcm.encrypt(state,state,len)) - keep the plaintext for the expansion below
 	buffer[6] = (KEYTYPE_XWING & 0x0F) | 0x20; // type with decrypt feature (bit 5)
-	ecc_priv_flash(buffer, false);
+	ecc_priv_flash(buffer, false, true); // quiet: the public key below IS the response
 
 	// Expand seed: SHAKE256(seed, 96)
 	uint8_t expanded[96];

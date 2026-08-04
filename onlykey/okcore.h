@@ -352,7 +352,11 @@ extern void initColor();
 extern void setcolor (uint8_t Color);
 extern void backup();
 extern void rsa_priv_flash (uint8_t *buffer, bool wipe);
-extern void ecc_priv_flash (uint8_t *buffer, bool wipe);
+// `quiet` suppresses the "Successfully set ECC Key" status message. The PQC
+// keygens store their seed by calling this and then answer the host with the
+// public key, and a status message sent first would be read as the first 64
+// bytes of that key - see the comment at the hidprint in okcore.cpp.
+extern void ecc_priv_flash (uint8_t *buffer, bool wipe, bool quiet = false);
 extern void flash_modify (int index, uint8_t *sector, uint8_t *data, int size, bool wipe);
 extern void RESTORE (uint8_t *buffer);
 extern void process_packets (uint8_t *buffer, int len, uint8_t *blocknum);

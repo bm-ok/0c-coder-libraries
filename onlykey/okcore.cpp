@@ -2256,8 +2256,19 @@ void wipe_slot(uint8_t *buffer)
 		#endif
 		okcore_flashset_2fa_key((buffer + 7), 0, slot);
 		hidprint("Successfully wiped 2FA Key");
- 		okeeprom_eeset_2FAtype(0, slot); 
-		yubikey_eeset_counter(0, slot);
+		/* These setters take a uint8_t* and dereference it; passing 0 is a null
+		 * POINTER, not the value zero - the same mistake already fixed at
+		 * OnlyKey.ino's failedlogins and sincelastregularlogin calls. It stored
+		 * zero on the device only by accident: address 0 is the vector table's
+		 * initial stack pointer, whose first byte little-endian is 0x00, and it
+		 * is readable, so the wipe appeared to work. It is still a NULL
+		 * dereference, and it faults anywhere page zero is unmapped - which is
+		 * how it was found, as a segfault in wipe_slot() under the emulator.
+		 * Two bytes, not one: yubikey_eeset_counter writes EElen_counter (2) on
+		 * slot 0 and a single byte on slots 1-24. */
+		{ uint8_t zeros[2] = { 0, 0 };
+		okeeprom_eeset_2FAtype(zeros, slot);
+		yubikey_eeset_counter(zeros, slot); }
 	}
 	blink(1);
 	return;
@@ -7642,7 +7653,9 @@ void process_setreport()
 					if (recv_buffer[7]+recv_buffer[8]+recv_buffer[9]+recv_buffer[10]+recv_buffer[11] == 0) {
 						// Wipe CR slot
 						temp[5] = recv_buffer[5];
-						okeeprom_eeset_hmac_challengemode(0); // Reset to default both slots require button press
+						/* &zero, not 0: this setter dereferences its argument - see
+						 * the note in wipe_slot(). EElen_hmac_challengemode is 1. */
+						{ uint8_t zero = 0; okeeprom_eeset_hmac_challengemode(&zero); } // Reset to default both slots require button press
 						if (recv_buffer[5] == RESERVED_KEY_HMACSHA1_1 || recv_buffer[5] == RESERVED_KEY_HMACSHA1_2) {
 							wipe_private(temp, false);
 						} else {

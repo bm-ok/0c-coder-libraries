@@ -13,7 +13,7 @@
 #include <stdint.h>
 #include <time.h>
 
-#include "mlkem_native/mlkem_native.h"
+#include "mlkem_native.h"
 
 /* Access SHA3-256 and SHAKE256 from mlkem-native */
 extern void PQCP_MLKEM_NATIVE_MLKEM768_sha3_256(uint8_t *output, const uint8_t *input, size_t inlen);

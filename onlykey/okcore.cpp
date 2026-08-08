@@ -121,7 +121,7 @@ int Profile_Offset = 0;
 // Parts of some libraries required for international travel edition 
 // not including full libraries as those libraries include crypto 
 
-#define CTAPHID_BUFFER_SIZE         7609
+#define CTAPHID_BUFFER_SIZE         6585
 #define CTAP2_ERR_NO_OPERATION_PENDING      0x2A
 #define CTAP2_ERR_USER_ACTION_PENDING       0x23
 #define CTAP2_ERR_DATA_READY                0xF6
@@ -254,8 +254,21 @@ int large_resp_buffer_offset;
 
 uint8_t ctap_buffer[CTAPHID_BUFFER_SIZE];
 // Reuse ctap_buffer as it uses 7K of RAM
-uint8_t *large_resp_buffer = ctap_buffer + CTAPHID_BUFFER_SIZE - LARGE_RESP_BUFFER_SIZE;				// Last 1024 bytes used to store temp data
-uint8_t *large_buffer = ctap_buffer + CTAPHID_BUFFER_SIZE - LARGE_RESP_BUFFER_SIZE - LARGE_BUFFER_SIZE; // Next 1024 bytes used to store temp data
+// RAM-NEUTRAL decoupling test: large_resp_buffer gets its own array, and
+// ctap_buffer shrinks by exactly the 1024 bytes it used to lend - so total
+// globals are unchanged (30,540). The previous attempt kept ctap_buffer at 7609
+// and so silently added 1KB, which is why it could not separate "the overlay is
+// depended on" from "the stack has under 1KB of headroom".
+// large_buffer keeps its original absolute address: 6585 - 1120 = 5465, the same
+// as the old 7609 - 1024 - 1120, so the X-Wing scratch at 0..3584 stays clear.
+uint8_t large_resp_buffer_store[LARGE_RESP_BUFFER_SIZE];
+uint8_t *large_resp_buffer = large_resp_buffer_store;
+uint8_t *large_buffer = ctap_buffer + CTAPHID_BUFFER_SIZE - LARGE_BUFFER_SIZE;
+// Tracks how much of large_resp_buffer has been delivered, for the chunked
+// retrieval in send_stored_response() (ok_extension.cpp). Must be reset
+// wherever large_resp_buffer_offset is - it indexes into that buffer.
+int large_resp_buffer_cursor;
+uint8_t large_resp_buffer_last_opt3;
 uint8_t packet_buffer[PACKET_BUFFER_SIZE];
 uint8_t packet_buffer_details[5];
 uint8_t recv_buffer[64];
@@ -838,7 +851,12 @@ void set_built_in_pin() {
 	pin_set = 3;
 	// 19-35 bytes of chip ID used instead of primary PIN
 	set_primary_pin((uint8_t*)recv_buffer, KEYBOARD_AUTO_PIN_SET);
-	okeeprom_eeset_timeout(0); // No timeout as there is no PIN required
+	// okeeprom_eeset_timeout() takes a uint8_t*, and okeeprom_eeset_common()
+	// dereferences it. Passing 0 is a null POINTER, not the value zero; it only
+	// stores zero here because address 0 on the MK20DX256 is the vector table's
+	// initial stack pointer, whose first byte little-endian is 0x00.
+	uint8_t no_timeout = 0;
+	okeeprom_eeset_timeout(&no_timeout); // No timeout as there is no PIN required
 	initcheck = okcore_flashget_noncehash ((uint8_t*)nonce, 32); 
 	okcore_flashget_pinhashpublic ((uint8_t*)p1hash, 32); //store PIN hash
     initialized = true;
@@ -2238,8 +2256,19 @@ void wipe_slot(uint8_t *buffer)
 		#endif
 		okcore_flashset_2fa_key((buffer + 7), 0, slot);
 		hidprint("Successfully wiped 2FA Key");
- 		okeeprom_eeset_2FAtype(0, slot); 
-		yubikey_eeset_counter(0, slot);
+		/* These setters take a uint8_t* and dereference it; passing 0 is a null
+		 * POINTER, not the value zero - the same mistake already fixed at
+		 * OnlyKey.ino's failedlogins and sincelastregularlogin calls. It stored
+		 * zero on the device only by accident: address 0 is the vector table's
+		 * initial stack pointer, whose first byte little-endian is 0x00, and it
+		 * is readable, so the wipe appeared to work. It is still a NULL
+		 * dereference, and it faults anywhere page zero is unmapped - which is
+		 * how it was found, as a segfault in wipe_slot() under the emulator.
+		 * Two bytes, not one: yubikey_eeset_counter writes EElen_counter (2) on
+		 * slot 0 and a single byte on slots 1-24. */
+		{ uint8_t zeros[2] = { 0, 0 };
+		okeeprom_eeset_2FAtype(zeros, slot);
+		yubikey_eeset_counter(zeros, slot); }
 	}
 	blink(1);
 	return;
@@ -2315,6 +2344,170 @@ void fadeout()
 		delay(9);
 	}
 }
+
+#ifdef DEBUG
+// Line buffer and press queue for the DEBUG serial protocol - see the parser in
+// touch_sense_loop() below for the grammar. Bytes accumulate here one per loop()
+// iteration and are acted on when a terminator arrives.
+// One SEREMU OUT report (SEREMU_RX_SIZE, usb_desc.h) is 32 bytes, so that is
+// what the host can deliver in a single write - sizing the line buffer to match
+// means any line the transport can carry in one report is also one the parser
+// will accept. The queue is sized so a full-length PIN (the firmware's own
+// limit is 10 digits) fits in one line without the caller splitting it.
+#define DBG_LINE_MAX 32   //raw bytes accepted before the terminator
+#define DBG_QUEUE_MAX 16  //decoded press events held for replay
+
+// Press durations, in the units payload() (OnlyKey.ino) compares against. The
+// bands that matter there: <=20 tap, >=72 hold actions, >=140 key labels,
+// >=180 DUO config mode, >=360 DUO factory default. A single fixed 128 used to
+// be the only hold available here, leaving everything from 140 up unreachable.
+#define DBG_PRESS_TAP 1
+#define DBG_PRESS_HOLD 128       //'!'   - a plain hold, the >=72 actions
+#define DBG_PRESS_HOLD_LONG 200  //'!!'  - clears the >=180 band
+#define DBG_PRESS_HOLD_MAX 400   //'!!!' - clears the >=360 band
+#define DBG_PRESS_MAX 1000       //ceiling for the explicit '#<ticks>' form
+
+static char dbgLine[DBG_LINE_MAX];
+static uint8_t dbgLineLen = 0;
+static bool dbgLineOverflow = false;
+
+static int dbgQueueButton[DBG_QUEUE_MAX];
+static int dbgQueueDuration[DBG_QUEUE_MAX];
+static uint8_t dbgQueueLen = 0;   //slots filled
+static uint8_t dbgQueueNext = 0;  //slots already replayed
+
+// Reclaims the slots already replayed, so a queue that has been partly drained
+// still accepts a full line rather than reporting itself full at the tail.
+static void dbg_queue_compact () {
+	if (!dbgQueueNext) return;
+	for (uint8_t i = dbgQueueNext; i < dbgQueueLen; i++) {
+		dbgQueueButton[i - dbgQueueNext] = dbgQueueButton[i];
+		dbgQueueDuration[i - dbgQueueNext] = dbgQueueDuration[i];
+	}
+	dbgQueueLen -= dbgQueueNext;
+	dbgQueueNext = 0;
+}
+
+// Decodes a line whose first byte is a button digit into queued press events.
+// Tokens are self-delimiting - a digit opens one, '!' or '#<ticks>' modifies the
+// digit before it - so no separator byte is needed and space stays free to mean
+// what the pre-existing clients use it for.
+static void dbg_run_presses () {
+	dbg_queue_compact();
+
+	uint8_t queuedBefore = dbgQueueLen;
+	uint8_t i = 0;
+
+	while (i < dbgLineLen) {
+		char c = dbgLine[i++];
+		if (c < '1' || c > '6') {
+			Serial.print("DEBUG: '");
+			Serial.print(c);
+			Serial.println("' is not a button 1-6, press line ignored");
+			dbgQueueLen = queuedBefore; //roll back, so a bad line presses nothing
+			return;
+		}
+
+		int duration = DBG_PRESS_TAP;
+		if (i < dbgLineLen && dbgLine[i] == '#') { //explicit duration in ticks
+			i++;
+			int ticks = 0;
+			uint8_t digits = 0;
+			while (i < dbgLineLen && dbgLine[i] >= '0' && dbgLine[i] <= '9') {
+				if (ticks <= DBG_PRESS_MAX) ticks = (ticks * 10) + (dbgLine[i] - '0');
+				i++;
+				digits++;
+			}
+			if (!digits || ticks < 1) {
+				Serial.println("DEBUG: '#' needs a duration in ticks, press line ignored");
+				dbgQueueLen = queuedBefore;
+				return;
+			}
+			duration = ticks > DBG_PRESS_MAX ? DBG_PRESS_MAX : ticks;
+		} else { //'!' per hold tier
+			uint8_t holds = 0;
+			while (i < dbgLineLen && dbgLine[i] == '!') {
+				holds++;
+				i++;
+			}
+			if (holds == 1) duration = DBG_PRESS_HOLD;
+			else if (holds == 2) duration = DBG_PRESS_HOLD_LONG;
+			else if (holds >= 3) duration = DBG_PRESS_HOLD_MAX;
+		}
+
+		if (dbgQueueLen >= DBG_QUEUE_MAX) {
+			Serial.println("DEBUG: press queue full, remaining presses on this line dropped");
+			break;
+		}
+		dbgQueueButton[dbgQueueLen] = c;
+		dbgQueueDuration[dbgQueueLen] = duration;
+		dbgQueueLen++;
+	}
+}
+
+// True when the buffered line is exactly `path`.
+static bool dbg_line_is (const char *path) {
+	uint8_t i = 0;
+	while (path[i]) {
+		if (i >= dbgLineLen || dbgLine[i] != path[i]) return false;
+		i++;
+	}
+	return i == dbgLineLen;
+}
+
+// Decodes a line that is not a press as a command path: each byte selects a
+// deeper node, so a destructive command is only reachable by spelling out the
+// whole path in one line and no single stray byte can trigger one.
+static void dbg_run_command () {
+	if (dbg_line_is("8")) { //restart, no data touched
+		Serial.println("DEBUG: '8' restart requested, restarting now...");
+		CPU_RESTART(); //does not return
+		return;
+	}
+
+	// The trailing 'C' is the confirmation: a wipe needs its whole path in one
+	// line, so no single stray byte can reach one and no separate arm/confirm
+	// handshake (and the state it needed) has to be carried between lines.
+	if (dbg_line_is("0C")) {
+		Serial.println("DEBUG: '0C' confirmation received, wiping userspace only...");
+		wipeuserspace(); //wipes PIN/profile/slot data only, does NOT touch firmware; restarts, does not return
+		return;
+	}
+	if (dbg_line_is("9C")) {
+		Serial.println("DEBUG: '9C' confirmation received, performing full wipe (firmware + userspace)...");
+		factorydefault(); //wipes EEPROM+flash+firmware hash and restarts, does not return
+		return;
+	}
+
+	// Unrecognised path, deliberately silent beyond the echo the caller already
+	// got: this is the readiness-probe path (clients ping with a byte the
+	// firmware ignores) and it runs often enough that a print per probe would
+	// add avoidable noise to a channel already known to drop output under load.
+}
+
+// Acts on a completed line and empties the buffer.
+static void dbg_commit_line () {
+	if (dbgLineOverflow) {
+		Serial.println("DEBUG: input line longer than 32 bytes, ignored");
+		dbgLineLen = 0;
+		dbgLineOverflow = false;
+		return;
+	}
+	if (!dbgLineLen) return; //bare terminator, nothing to act on
+
+	// One echo per completed line, carrying its first byte - the button for a
+	// press line, the command for a path. Clients use this both as a
+	// per-line acknowledgement and as the "firmware is running loop()"
+	// readiness probe, so it is printed before the line is acted on.
+	Serial.print("I received from DEBUG: ");
+	Serial.println((int)(uint8_t)dbgLine[0], DEC);
+
+	if (dbgLine[0] >= '1' && dbgLine[0] <= '6') dbg_run_presses();
+	else dbg_run_command();
+
+	dbgLineLen = 0;
+}
+#endif
 
 int touch_sense_loop () {
 
@@ -2446,6 +2639,75 @@ int touch_sense_loop () {
 		#endif
 	}
 
+	#ifdef DEBUG
+	// Simulated button presses and debug commands for controlled testing, sent over the
+	// Serial (SEREMU) channel. Bytes accumulate into a line buffer and are acted on when a
+	// terminator arrives; return ('\n') is the terminator, and the line is zeroed after it.
+	//
+	// A line starting with '1'-'6' is a sequence of button presses, replayed one per loop()
+	// iteration. Tokens are self-delimiting, so a whole PIN attempt fits on one line and the
+	// caller does not have to pace the presses itself:
+	//   "1"       -> tap button 1
+	//   "1!"      -> hold (duration 128) - the tier the old space terminator produced
+	//   "1!!"     -> long hold (200), reaches payload()'s >=180 actions
+	//   "1!!!"    -> longest hold (400), reaches the >=360 DUO factory-default action
+	//   "1#250"   -> exact duration in ticks, for testing a specific band boundary
+	//   "1234567" -> seven taps, in order
+	//
+	// Any other line is a command path: each byte selects a deeper node, so a destructive
+	// command is only reachable by spelling out the whole path in a single line and no stray
+	// byte can trigger one. '0' and '9' are not buttons - they wipe the device back to a
+	// clean, unconfigured state, and the trailing 'C' is their confirmation:
+	//   "0C" -> userspace-only wipe (PIN/profile/slot data - wipeuserspace(), no reflash needed)
+	//   "9C" -> full wipe (also erases the firmware hash and forces the bootloader - factorydefault())
+	//   "8"  -> restart only (CPU_RESTART()), no data touched, so nothing to confirm. Needed
+	//           because completing PIN setup via the bare OKPIN/OKPINSEC/OKPINSD HID messages
+	//           (as OnlyKeyWizard.js does) commits flash state but does not itself reboot -
+	//           only the physical-button-driven okcore_quick_setup() flow reaches the
+	//           CPU_RESTART() at the end of backup-passphrase generation. 'initialized' is
+	//           only recomputed from flash at boot (OnlyKey.ino setup()), so a restart is
+	//           required before a freshly-set PIN shows up as INITIALIZED.
+	// An unrecognised path does nothing at all beyond the echo, which is what makes it
+	// usable as a readiness probe.
+	//
+	// Return is the only terminator. Space used to be a second one meaning "long press",
+	// which made it unusable as ordinary input and clashed with clients that line-buffer;
+	// it is now rejected with a message rather than silently ignored, so a caller still
+	// sending the old form finds out immediately instead of seeing its presses vanish.
+	if (Serial.available() > 0) { //if we have any data in the Serial input
+	    int incomingByte = Serial.read(); //trim off the first byte off Serial input buffer
+
+	    if (incomingByte == 10) { //return terminates and commits the line
+		dbg_commit_line();
+	    } else if (incomingByte == 32 || incomingByte == 9) { //space or tab
+		Serial.println("DEBUG: space is no longer a terminator - end the line with return, and use '!' for a hold");
+		dbgLineLen = 0;
+		dbgLineOverflow = false;
+	    } else if (incomingByte != 13 && incomingByte != 0) {
+		// CR is ignored so a client sending CRLF still works. NUL is ignored
+		// because this arrives over a fixed-size HID report (SEREMU_RX_SIZE
+		// is 32 bytes): the host writes a short line and the transport pads
+		// the rest with zeros, so every line is followed by padding that is
+		// not input.
+		if (dbgLineLen < DBG_LINE_MAX) dbgLine[dbgLineLen++] = (char)incomingByte;
+		else dbgLineOverflow = true; //resyncs at the next terminator
+	    }
+	}
+
+	// Replay one queued press per loop iteration. Pacing them here rather than on the host is
+	// what lets a multi-press line arrive in one write, and it matches the rate the physical
+	// button path feeds presses in at.
+	if (key_press == 0 && dbgQueueNext < dbgQueueLen) {
+		button_selected = dbgQueueButton[dbgQueueNext];
+		key_press = dbgQueueDuration[dbgQueueNext];
+		dbgQueueNext++;
+		if (dbgQueueNext >= dbgQueueLen) { //fully drained, start the next line at the front
+			dbgQueueNext = 0;
+			dbgQueueLen = 0;
+		}
+	}
+	#endif
+
 	if ((key_press > 0) && (key_off > 2)) {
 		if (onlykeyhw==OK_HW_DUO && button_3_on) {
 			button_selected = '3';
@@ -2558,7 +2820,7 @@ void hidprint(char const *chars)
 
 void send_transport_response(uint8_t *data, int len, uint8_t encrypt, uint8_t store)
 {
-	#ifdef DEBUG
+	#ifdef DEBUG_CTAP_VERBOSE
 	Serial.println("Sending transport response data");
 	byteprint(data, len);
 	Serial.println(outputmode);
@@ -2573,16 +2835,29 @@ void send_transport_response(uint8_t *data, int len, uint8_t encrypt, uint8_t st
 			else {
 				memcpy(resp_buffer, data+i, len-i);
 			}
-			#ifdef DEBUG
+			#ifdef DEBUG_CTAP_VERBOSE
 			byteprint(resp_buffer, 64);
 			#endif
-			RawHID.send2(resp_buffer, 0);
+			// RawHID.send2(buf, 0) gives up almost instantly if the firmware's
+			// 4-packet TX queue (TX_PACKET_LIMIT, usb_rawhid.c) is still full,
+			// returning 0 without sending - and that return value was never
+			// checked here, so a full queue silently dropped this chunk
+			// entirely. A real per-attempt timeout lets it actually wait for
+			// queue space to free up (usb_rawhid_send2() already loops on
+			// that internally, it just wasn't given any time budget to);
+			// retrying on top of that covers the rare case where one 100ms
+			// window still isn't enough. Root cause of the intermittent
+			// truncated multi-packet responses (X-Wing pubkey, etc.) seen
+			// from the host side all session.
+			for (int tries = 0; tries < 5; tries++) {
+				if (RawHID.send2(resp_buffer, 100)) break;
+			}
 		}
 	}
 	else if (profilemode != NONENCRYPTEDPROFILE && outputmode == WEBAUTHN)
 	{ //Webauthn
 #ifdef STD_VERSION
-  #ifdef DEBUG
+  #ifdef DEBUG_CTAP_VERBOSE
       Serial.print ("FIDO Response");
 	  byteprint(data, len);
 #endif
@@ -2768,6 +3043,9 @@ void keytype(char const *chars)
 void byteprint(uint8_t *bytes, int size)
 {
 #ifdef DEBUG
+	// Callers hand this null freely - webcryptcheck() does byteprint(_appid, 32)
+	// on a path where ctap_filter_invalid_credentials() passed no appid at all.
+	if (!bytes) return;
 	Serial.println();
 	for (int i = 0; i < size; i++)
 	{
@@ -2776,6 +3054,25 @@ void byteprint(uint8_t *bytes, int size)
 	}
 	Serial.println();
 #endif
+}
+
+// Wipes PIN/profile/slot data only - never touches the firmware hash bytes or
+// the bootloader-entry flag, so unlike factorydefault() in FULLWIPE mode this
+// never forces a reflash. Used by the DEBUG serial '0'/'C' test command so
+// automated test runs can reset device state without needing a human to
+// reflash between runs.
+void wipeuserspace()
+{
+	wipeEEPROM();
+	wipeflashdata();
+	initialized = false;
+	unlocked = true;
+#ifdef DEBUG
+	Serial.println("userspace wipe has been completed");
+#endif
+	hidprint("userspace wipe has been completed");
+	delay(100);
+	CPU_RESTART();
 }
 
 void factorydefault()
@@ -2798,7 +3095,15 @@ void factorydefault()
 			eeprom_write_byte((unsigned char *)i, 0);
 		}
 #ifdef DEBUG
+#ifdef OK_EMULATOR
+		// Page zero is deliberately left unmapped on a hosted build (mapping it
+		// would need vm.mmap_min_addr=0, removing NULL-dereference protection
+		// machine-wide). Start at the first mapped flash page instead - this is
+		// diagnostic output only and nothing depends on its contents.
+		uintptr_t adr = 0x1000;
+#else
 		uintptr_t adr = 0x0;
+#endif
 		for (int i = 0; i < 65536; i += 4)
 		{
 			Serial.println(adr, HEX);
@@ -2824,6 +3129,11 @@ void wipeEEPROM()
 	//Erase all EEPROM values
 	uint8_t value;
 #ifdef DEBUG
+	Serial.println("Wiping EEPROM...");
+#endif
+#ifdef DEBUG_CTAP_VERBOSE
+	//Full 2048-byte dump is very slow over Serial (thousands of print calls) - only enable
+	//for deep debugging, not on every wipe/factory reset under plain DEBUG.
 	Serial.println("Current EEPROM Values");
 	for (int i = 0; i < 2048; i++)
 	{
@@ -2839,21 +3149,19 @@ void wipeEEPROM()
 	{
 		EEPROM.write(i, value);
 	}
-#ifdef DEBUG
+#ifdef DEBUG_CTAP_VERBOSE
 	Serial.println("EEPROM set to 0s");
-#endif
 	for (int i = 0; i < 2048; i++)
 	{
 		value = EEPROM.read(i);
-#ifdef DEBUG
 		Serial.print(i);
 		Serial.print("\t");
 		Serial.print(value, DEC);
 		Serial.println();
-#endif
 	}
+#endif
 #ifdef DEBUG
-	Serial.println("EEPROM erased"); //TODO remove debug
+	Serial.println("EEPROM erased");
 #endif
 }
 
@@ -2886,8 +3194,15 @@ void wipeflashdata()
 
 
 /*************************************/
-void okcore_flashget_common(uint8_t *ptr, unsigned long *adr, int len)
+/*
+ * Walk flash one 32-bit word per iteration, matching the `z = z + 4` stride
+ * over the byte buffer. `unsigned long` is the flash word type on this target
+ * but is 8 bytes wherever long is 64-bit, which would step two words at a time
+ * while the field offsets - plain byte arithmetic on uintptr_t - do not double.
+ */
+void okcore_flashget_common(uint8_t *ptr, unsigned long *adr_in, int len)
 {
+	uint32_t *adr = (uint32_t *)adr_in;
 	for (int z = 0; z <= len - 4; z = z + 4)
 	{
 		//Serial.println(" 0x%X", (adr));
@@ -2909,8 +3224,10 @@ void okcore_flashget_common(uint8_t *ptr, unsigned long *adr, int len)
 	return;
 }
 
-void okcore_flashset_common(uint8_t *ptr, unsigned long *adr, int len)
+/* Same 32-bit stride as okcore_flashget_common above. */
+void okcore_flashset_common(uint8_t *ptr, unsigned long *adr_in, int len)
 {
+	uint32_t *adr = (uint32_t *)adr_in;
 	for (int z = 0; z <= len - 4; z = z + 4)
 	{
 		unsigned long data = (uint8_t) * (ptr + z + 3) | ((uint8_t) * (ptr + z + 2) << 8) | ((uint8_t) * (ptr + z + 1) << 16) | ((uint8_t) * (ptr + z) << 24);
@@ -4944,7 +5261,7 @@ int okcore_flashget_ECC(uint8_t slot)
 	return 0;
 }
 
-void ecc_priv_flash(uint8_t *buffer, bool wipe)
+void ecc_priv_flash(uint8_t *buffer, bool wipe, bool quiet)
 {
 
 	if (profilemode == NONENCRYPTEDPROFILE)
@@ -4982,7 +5299,58 @@ void ecc_priv_flash(uint8_t *buffer, bool wipe)
 	int gen_key = buffer[7] + buffer[8] + buffer[9] + buffer[10] + buffer[11] + buffer[12] + buffer[13] + buffer[14];
 	if (gen_key == 2040)
 	{ //All FFs, trigger to generate a randomly generated key
+		uint8_t basetype = buffer[6] & 0x0F;
+		if (basetype == KEYTYPE_MLKEM768 || basetype == KEYTYPE_XWING) {
+			// PQC keygen requires an explicit button-confirmation challenge
+			// first, same pattern as decaps (okcrypto_xwing_decaps /
+			// okcrypto_mlkem_decaps): prime the 3-button challenge via
+			// process_packets()/done_process_packets() and wait for
+			// CRYPTO_AUTH to reach 4 (set by the button-press handler in
+			// OnlyKey.ino) before actually generating anything. Without
+			// this gate, okcrypto_xwing_keygen()/okcrypto_mlkem_keygen()'s
+			// own `if (!CRYPTO_AUTH)` check can never be satisfied - CRYPTO_AUTH
+			// is otherwise only ever primed by the decaps functions, for their
+			// own unrelated operations.
+			if (!CRYPTO_AUTH) {
+				uint8_t primebuf[64];
+				memset(primebuf, 0, 64);
+				primebuf[4] = buffer[4];
+				primebuf[5] = buffer[5];
+				primebuf[6] = 9; // final-packet length: 1 (keytype) + 8 (trigger bytes)
+				primebuf[7] = buffer[6];
+				memcpy(primebuf + 8, buffer + 7, 8);
+				process_packets(primebuf, 0, 0);
+				pending_operation = CTAP2_ERR_USER_ACTION_PENDING;
+				return;
+			} else if (CRYPTO_AUTH != 4) {
+				return; // challenge in progress, ignore re-entrant triggers
+			}
+			// CRYPTO_AUTH==4: confirmed via the 3-button challenge, proceed.
+		}
 		okcrypto_generate_random_key(buffer);
+		if (basetype == KEYTYPE_MLKEM768 || basetype == KEYTYPE_XWING) {
+			// The PQC keygens STORE THE SEED THEMSELVES and must not fall
+			// through to the write below.
+			//
+			// okcrypto_xwing_keygen() (and its ML-KEM twin) generates a 32-byte
+			// seed into buffer+7 and calls back into this function to save it -
+			// that inner call encrypts the seed in place, writes the slot, and
+			// records the key type with its decrypt-feature bit. It then expands
+			// its own plaintext copy of the seed and answers the host with the
+			// public key.
+			//
+			// Falling through here encrypts the ALREADY ENCRYPTED buffer a
+			// second time and writes E(E(seed)) over the slot the inner call
+			// just wrote correctly. The device then holds a key that is not the
+			// one whose public half it just reported: --generate prints one
+			// recipient, --recipient reads back a different one, and anything
+			// encrypted to the first can never be decrypted by anyone.
+			//
+			// Found by the test kit asking the device a second question
+			// (02-cli/01-pqc-keygen), which is also what counts the flash
+			// writes: one keygen must erase the sector once, not twice.
+			return;
+		}
 	}
 #ifdef DEBUG
 	Serial.print("ECC Key value =");
@@ -5018,10 +5386,20 @@ void ecc_priv_flash(uint8_t *buffer, bool wipe)
 	{ //Designated Backup Passphrase slot
 		hidprint("Successfully set Backup Passphrase");
 	}
-	else if (gen_key != 0 && initcheck)
+	else if (gen_key != 0 && initcheck && !quiet)
 	{
+		// `quiet` is the PQC keygens storing their seed.
+		//
+		// This status message goes out as an ordinary transport response, and
+		// okcrypto_xwing_keygen() sends the 1216-byte public key immediately
+		// after it. A host reading 1216 bytes has no way to tell the two apart:
+		// it takes this message as the first 64-byte report of the key, and
+		// ends up with "Successfully set ECC Key", forty zero bytes, and the
+		// real key shifted 64 bytes along - so pk_X falls off the end entirely.
+		// The recipient it then prints is not a key the device has, and
+		// anything encrypted to it is lost.
 		hidprint("Successfully set ECC Key");
-		if (buffer[0] != 0xBA) 
+		if (buffer[0] != 0xBA)
 			blink(2);
 	} else if (wipe) {
 		hidprint("Successfully wiped ECC Key");
@@ -5357,6 +5735,12 @@ int ctap_flash(int index, uint8_t *buffer, int size, uint8_t mode)
 		//hidprint("Successfully set CTAP Value");
 	}
 	#endif
+	// The mode==2 (write resident key) branch above has no return of its own,
+	// and the #endif closes #ifdef STD_VERSION - so a non-STD_VERSION build has
+	// an entirely empty body. Falling off the end of a non-void function is
+	// undefined behaviour; every other branch returns 0 on success, and both
+	// callers of mode 2 (device.cpp, okcore.cpp) discard the result.
+	return 0;
 }
 
 void flash_modify(int index, uint8_t *sector, uint8_t *data, int size, bool wipe)
@@ -5598,6 +5982,7 @@ bool wipebuffersafter5sec(Task *me)
 void wipetasks() {
 	packet_buffer_offset = 0;
 	memset(ctap_buffer, 0, CTAPHID_BUFFER_SIZE);
+	memset(large_resp_buffer, 0, LARGE_RESP_BUFFER_SIZE);
 	memset(keyboard_buffer, 0, KEYBOARD_BUFFER_SIZE);
 	memset(packet_buffer_details, 0, sizeof(packet_buffer_details));
 	setBuffer[7] = 0;
@@ -5615,6 +6000,12 @@ void wipetasks() {
 		memset(setBuffer, 0, 9);
 	}
 	large_resp_buffer_offset = 0;
+	// The chunked-retrieval cursor indexes into the buffer being invalidated
+	// here, so it must die with it. Left stale, the next response is served
+	// from the previous one's position - the caller gets its tail, or
+	// nothing, with no error anywhere.
+	large_resp_buffer_cursor = 0;
+	large_resp_buffer_last_opt3 = 0;
 	CRYPTO_AUTH = 0;
 	Challenge_button1 = 0;
 	Challenge_button2 = 0;
@@ -7093,7 +7484,17 @@ void process_packets(uint8_t *buffer, int len, uint8_t *blocknum)
 	}
 	else
 	{ //Last packet
-		if (packet_buffer_offset <= (int)(PACKET_BUFFER_SIZE - 57) && buffer[6] <= 57 && buffer[6] >= 1)
+		// This used to reuse the not-last-packet branch's threshold
+		// (PACKET_BUFFER_SIZE - 57), which checks "is there room for
+		// another full 57-byte chunk" - too strict for the final,
+		// partial chunk. For a PACKET_BUFFER_SIZE that isn't an exact
+		// multiple of 57 (e.g. XWING_CT_SIZE=1120=19*57+37), the offset
+		// after 19 full chunks (1083) already exceeds that threshold
+		// (1063) even though the actual final append (1083+37=1120)
+		// fits exactly - so the last chunk was rejected 100% of the
+		// time and X-Wing/ML-KEM decapsulation could never complete.
+		// The real question is just whether *this* chunk fits.
+		if (packet_buffer_offset + buffer[6] <= (int)PACKET_BUFFER_SIZE && buffer[6] <= 57 && buffer[6] >= 1)
 		{
 			memcpy(packet_buffer + packet_buffer_offset, buffer + 7, buffer[6]);
 			packet_buffer_offset = packet_buffer_offset + buffer[6];
@@ -7180,6 +7581,9 @@ void done_process_packets()
 	okcore_aes_gcm_encrypt(packet_buffer, packet_buffer_details[0], packet_buffer_details[1], profilekey, packet_buffer_offset);
 	// Just in case there is still a response stored
 	large_resp_buffer_offset = 0;
+	// Same reasoning as the other reset site.
+	large_resp_buffer_cursor = 0;
+	large_resp_buffer_last_opt3 = 0;
 	memset(large_resp_buffer, 0, large_resp_buffer_offset);
 	// Move encrypted data to large_buffer
 	large_buffer_offset = packet_buffer_offset;
@@ -7282,7 +7686,9 @@ void process_setreport()
 					if (recv_buffer[7]+recv_buffer[8]+recv_buffer[9]+recv_buffer[10]+recv_buffer[11] == 0) {
 						// Wipe CR slot
 						temp[5] = recv_buffer[5];
-						okeeprom_eeset_hmac_challengemode(0); // Reset to default both slots require button press
+						/* &zero, not 0: this setter dereferences its argument - see
+						 * the note in wipe_slot(). EElen_hmac_challengemode is 1. */
+						{ uint8_t zero = 0; okeeprom_eeset_hmac_challengemode(&zero); } // Reset to default both slots require button press
 						if (recv_buffer[5] == RESERVED_KEY_HMACSHA1_1 || recv_buffer[5] == RESERVED_KEY_HMACSHA1_2) {
 							wipe_private(temp, false);
 						} else {
@@ -7559,23 +7965,31 @@ void okcore_aes_cbc_decrypt (uint8_t * state, const uint8_t * key, int len)
 
 char * HW_MODEL(char const * in) {
 	// HW_MODEL p=OnlyKey DUO with PIN, n=OnlyKey DUO without PIN, c=OnlyKey LQFP or BGA w/dual LEDs, o=Discontinued OnlyKey Orignal
-	char out[strlen(in)+2];
-	memcpy(out,in,strlen(in));
+	// The result is returned to the caller, so it cannot live in this frame:
+	// `char out[strlen(in)+2]` is a VLA that dies with the frame, leaving the
+	// caller reading freed stack. A function-static buffer has the same
+	// single-threaded lifetime the callers already assume - the result is
+	// consumed immediately by hidprint() - and removes the undefined behaviour.
+	// Bounded so a long input cannot overrun.
+	static char out[64];
+	size_t n = strlen(in);
+	if (n > sizeof(out) - 2) n = sizeof(out) - 2;
+	memcpy(out, in, n);
 	#ifdef OK_Color
 	if (onlykeyhw==OK_HW_DUO) {
 		if (Duo_config[0]==1) {
-			out[sizeof(out)-2] = 'n';
+			out[n] = 'n';
 		} else {
-			out[sizeof(out)-2] = 'p';	
+			out[n] = 'p';
 		}
 	} else {
-		out[sizeof(out)-2] = 'c';
+		out[n] = 'c';
 	}
 	#else
-	out[sizeof(out)-2] = 'o';
+	out[n] = 'o';
 	#endif
-	out[sizeof(out)-1] = 0;
-	return (char*)out;
+	out[n + 1] = 0;
+	return out;
 }
 
 void okcore_pin_login ()

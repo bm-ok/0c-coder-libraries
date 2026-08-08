@@ -120,17 +120,38 @@ int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
 
 void store_FIDO_response (uint8_t *data, int len, uint8_t encrypt) {
     cancelfadeoffafter20();
-  if (len >= (int)LARGE_RESP_BUFFER_SIZE) return; //Double check buf overflow
+  if (len >= (int)LARGE_RESP_BUFFER_SIZE) {
+    // Was a bare `return`. A response too large to stage then vanished with no
+    // error anywhere, and the next OKPING - finding nothing staged and
+    // CRYPTO_AUTH cleared by the completed operation - answered "Error
+    // incorrect challenge was entered", about a challenge that had in fact
+    // been entered correctly. Say what actually happened instead.
+    hidprint("Error response too large to store");
+    return;
+  }
 	if (encrypt==1) {
 		okcrypto_aes_crypto_box (data, len, false);
 	} else if (encrypt==2) {
-		okcrypto_aes_crypto_box (data+32, len-32, false); // Don't encrypt pubkey 
+		okcrypto_aes_crypto_box (data+32, len-32, false); // Don't encrypt pubkey
 	} else {
     // Unencrypted message, check if it's an error message
     if (strcmp((char*)data, "Error")) {
-      memset(large_resp_buffer, 0, LARGE_RESP_BUFFER_SIZE);
+      // `data` may BE large_resp_buffer: okpqc_decrypt() writes each half's
+      // 32-byte shared secret there and then calls send_transport_response()
+      // on it. Clearing the whole buffer here erased the very bytes the
+      // memmove below was about to copy, so the copy moved zeros onto zeros.
+      // Measured 2026-08-01: a correct X25519 shared secret reached the host
+      // as 32 zero bytes, with no error on either side. Clear only the region
+      // that is not the payload.
+      if (data >= large_resp_buffer && data < large_resp_buffer + LARGE_RESP_BUFFER_SIZE) {
+        int used = (int)(data - large_resp_buffer) + len;
+        memset(large_resp_buffer, 0, (int)(data - large_resp_buffer));
+        memset(large_resp_buffer + used, 0, LARGE_RESP_BUFFER_SIZE - used);
+      } else {
+        memset(large_resp_buffer, 0, LARGE_RESP_BUFFER_SIZE);
+      }
       CRYPTO_AUTH = 0;
-    } 
+    }
   }
   large_resp_buffer_offset = len;
 
@@ -182,8 +203,8 @@ int device_is_nfc()
 
 void usbhid_send(uint8_t * msg)
 {
+    #ifdef DEBUG_CTAP_VERBOSE
     printf1(TAG_GREEN, "Sending FIDO response block");
-    #ifdef DEBUG
 	byteprint(msg, 64);
     #endif
     extern uint8_t useinterface;
@@ -206,10 +227,12 @@ int authenticator_read_state(AuthenticatorState * a)
 {
    	uint8_t buffer[sizeof(AuthenticatorState)];
     int ret;
+    #ifdef DEBUG_CTAP_VERBOSE
     printf1(TAG_GREEN, "authenticator_read_state");
+    #endif
 	ret = ctap_flash (0, buffer, sizeof(AuthenticatorState), 3);
 	memcpy((uint8_t*)a, buffer, sizeof(AuthenticatorState));
-    #ifdef DEBUG
+    #ifdef DEBUG_CTAP_VERBOSE
 	byteprint(buffer,sizeof(AuthenticatorState));
     #endif
     return ret;
@@ -218,14 +241,18 @@ int authenticator_read_state(AuthenticatorState * a)
 void authenticator_read_backup_state(AuthenticatorState * a)
 {
    	//This function is unnecessary, using EEPROM
+    #ifdef DEBUG_CTAP_VERBOSE
     printf1(TAG_GREEN, "authenticator_read_backup_state");
+    #endif
 }
 
 // Return 1 yes backup is init'd, else 0
 int authenticator_is_backup_initialized()
 {
     //This function is unnecessary, using EEPROM
+    #ifdef DEBUG_CTAP_VERBOSE
     printf1(TAG_GREEN, "authenticator_is_backup_initialized");
+    #endif
 	return 0;
 }
 
@@ -233,11 +260,13 @@ void authenticator_write_state(AuthenticatorState * a)
 {
 
 	uint8_t buffer[sizeof(AuthenticatorState)];
-    printf1(TAG_GREEN, "authenticator_write_state");
 	memcpy(buffer, (uint8_t*)a, sizeof(AuthenticatorState));
+    #ifdef DEBUG_CTAP_VERBOSE
+    printf1(TAG_GREEN, "authenticator_write_state");
     printf1(TAG_GREEN, "authenticator_write_state size %d\n", sizeof(AuthenticatorState));
+    #endif
     ctap_flash (0, buffer, sizeof(AuthenticatorState), 4);
-    #ifdef DEBUG
+    #ifdef DEBUG_CTAP_VERBOSE
 	byteprint(buffer,sizeof(AuthenticatorState));
     #endif
 }
@@ -258,6 +287,11 @@ uint32_t ctap_atomic_count(uint32_t amount)
     } else {
         setCounter(amount+counter1);
     }
+    // The amount != 0 branches above set the counter and then fall off the end
+    // of a non-void function - undefined behaviour. Re-reading is what the
+    // amount == 0 branch effectively returns; the caller in ctaphid.cpp that
+    // passes a non-zero amount ignores the result either way.
+    return getCounter();
 }
 
 void device_manage(void)
@@ -297,7 +331,9 @@ void device_disable_up(bool disable)
 
 int ctap_user_presence_test(uint32_t wait)
 {
+    #ifdef DEBUG_CTAP_VERBOSE
     printf1(TAG_GREEN, "ctap_user_presence_test");
+    #endif
     extern Adafruit_NeoPixel pixels;
     int ret = 0;
     uint32_t t1 = millis();

@@ -38,6 +38,15 @@
 /* component selector (buffer[6]): which half of the composite to run */
 #define PQC_HALF_ECC        0    /* Ed25519 / X25519 */
 #define PQC_HALF_PQC        1    /* ML-DSA-65 / ML-KEM-768 */
+/* Sign-path selector that returns the derived ML-DSA-65 public key rather than
+ * a signature, so a host can confirm which key a slot actually holds.
+ * okcrypto_getpubkey() has no KEYTYPE_PQC_PGP branch, so this is the only way
+ * to see it. */
+#define PQC_HALF_PQC_PUBKEY 2
+/* Returns the 32 raw ML-DSA seed bytes the device has stored, so a host can
+ * tell a wrong-seed fault from a wrong-derivation one. DEBUG-only: this is
+ * private key material and must never ship in a production build. */
+#define PQC_HALF_PQC_SEED   3
 
 /* sizes (FIPS 203 / 204) */
 #define MLKEM_CT_SIZE       1088

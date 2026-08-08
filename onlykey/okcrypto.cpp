@@ -96,7 +96,7 @@
 //ML-KEM-768 (FIPS 203) support
 /*************************************/
 extern "C" {
-#include "mlkem_native/mlkem_native.h"
+#include "mlkem_native.h"
 }
 
 // Access SHA3-256 and SHAKE256 from mlkem-native (already compiled in)
@@ -299,16 +299,53 @@ void okcrypto_decrypt (uint8_t *buffer){
 	Serial.println();
 	Serial.println("OKDECRYPT MESSAGE RECEIVED");
 	#endif
-	if (buffer[5] == RESERVED_KEY_WEB_DERIVATION && (buffer[6] & 0x0F) == KEYTYPE_XWING) {
-		// Derived X-Wing decaps over HID (split custody). Input carries the
-		// 32-byte label tag then ct_X(32). NOTE: 32+32=64B exceeds one 57-byte
-		// report, so the host packetizes; VALIDATE the input framing on hardware
-		// (label at buffer+7, ct_X at buffer+7+32 assumes a single assembled buffer).
-		// Returns [ ss_X(32) | mlkem_seed(32) ]; the host finishes the ML-KEM half.
+	if (buffer[5] == RESERVED_KEY_WEB_DERIVATION) {
+		// Derived X-Wing decaps over HID (split custody): label(32)+ct_X(32)
+		// =64B exceeds one 57-byte HID report, so the host
+		// (derive_decaps(), onlykey_hid.py) sends it via
+		// send_large_message2()'s standard multi-packet framing, which puts
+		// the CONTINUATION marker in buffer[6] (0xFF = more chunks coming,
+		// else = this many bytes is the final chunk) - not a keytype
+		// selector. This used to also require
+		// `(buffer[6] & 0x0F) == KEYTYPE_XWING`, which only ever matched
+		// okcrypto_getpubkey()'s single-packet OKGETPUBKEY sibling (built
+		// with a *different* host method, _send_and_receive(), that really
+		// does put key_type in buffer[6] since it never chunks). For this
+		// multi-packet OKDECRYPT case chunk 1 has buffer[6]=0xFF (masked:
+		// 0x0F, not KEYTYPE_XWING's 6) and chunk 2 has buffer[6]=7 (the
+		// remaining byte count; masked: 7, not 6) - so the check never
+		// matched either chunk, and both silently fell through to the
+		// general slot-dispatch logic below, using a stale `type` value and
+		// running the wrong decap function on garbage data. Confirmed live
+		// (onlykey-testing TC-17): derive_decaps() always completed with no
+		// error, but with a shared secret that never matched the sender's -
+		// exactly this, not a byte-level issue. (The previous single-packet
+		// version here also read `buffer + 7 + 32` = up to `buffer[70]`,
+		// past `recv_buffer[64]`'s end - a real out-of-bounds read, but
+		// dead code given the above, never actually reached; moot now that
+		// this reassembles into its own right-sized buffer below instead of
+		// reading straight out of the raw per-report buffer.)
+		// RESERVED_KEY_WEB_DERIVATION (128) is unique within OKDECRYPT's
+		// dispatch, so buffer[5] alone is enough to recognize every chunk of
+		// this request.
+		static uint8_t derive_buf[64];
+		static int derive_offset = 0;
+		if (buffer[6] == 0xFF) {
+			if (derive_offset + 57 <= 64) {
+				memcpy(derive_buf + derive_offset, buffer + 7, 57);
+				derive_offset += 57;
+			}
+			return;
+		}
+		if (derive_offset + buffer[6] == 64) {
+			memcpy(derive_buf + derive_offset, buffer + 7, buffer[6]);
+		}
+		derive_offset = 0;
 		uint8_t out64[64];
-		okcrypto_xwing_web_derive(buffer + 7, buffer + 7 + 32, out64);
+		okcrypto_xwing_web_derive(derive_buf, derive_buf + 32, out64);
 		send_transport_response(out64, 64, false, false);
 		memset(out64, 0, 64);
+		memset(derive_buf, 0, 64);
 		return;
 	}
 	if (buffer[5] < 101) { //Slot 101-132 are for ECC, 1-4 are for RSA
@@ -333,7 +370,25 @@ void okcrypto_decrypt (uint8_t *buffer){
 		okcrypto_ecdh(buffer);
 	} else {
 		if (buffer[5] > 100 && buffer[5] < 117) { // Keys 117 - 132 reserved
-			features = okcore_flashget_ECC ((int)buffer[5]);
+			// okcore_flashget_ECC() does a flash read + AES-GCM decrypt to
+			// populate ecc_private_key - expensive, and this dispatcher runs
+			// once per incoming HID report. For MLKEM/XWING, the multi-packet
+			// ciphertext send (~20 reports for X-Wing) only actually needs
+			// ecc_private_key once CRYPTO_AUTH==4 (okcrypto_xwing_decaps()/
+			// okcrypto_mlkem_decaps() don't touch it before then - earlier
+			// reports just accumulate via process_packets()). Paying that
+			// cost on every one of ~20 reports was slow enough to cause real
+			// receive-side USB packet loss under the burst (confirmed live:
+			// only ~10 of ~20 chunks were arriving). type still needs
+			// refreshing every time for correct dispatch below, just not the
+			// expensive part - okeeprom_eeget_ecckey() is the cheap lookup
+			// okcore_flashget_ECC() itself starts with.
+			if ((type == KEYTYPE_MLKEM768 || type == KEYTYPE_XWING) && CRYPTO_AUTH && CRYPTO_AUTH != 4) {
+				okeeprom_eeget_ecckey(&type, buffer[5]);
+				type = type & 0x0F;
+			} else {
+				features = okcore_flashget_ECC ((int)buffer[5]);
+			}
 		}
 		if (type == 0) {
 			hidprint("Error no key set in this slot");
@@ -1807,13 +1862,16 @@ void okcrypto_mlkem_keygen (uint8_t *buffer) {
 
 	// Generate 32-byte seed, store via existing ECC slot infrastructure
 	// buffer[5] = slot (set by caller), buffer[6] = type, buffer[7..38] = key data
+	uint8_t seed[32];
 	RNG2(buffer + 7, 32);
+	memcpy(seed, buffer + 7, 32); // ecc_priv_flash() below encrypts buffer+7 in place (gcm.encrypt(state,state,len)) - keep the plaintext for the expansion below
 	buffer[6] = (KEYTYPE_MLKEM768 & 0x0F) | 0x20; // type with decrypt feature (bit 5)
-	ecc_priv_flash(buffer, false);
+	ecc_priv_flash(buffer, false, true); // quiet: the public key below IS the response
 
 	// Expand seed to 64-byte coins: SHAKE256(seed, 64)
 	uint8_t coins[64];
-	xwing_shake256(coins, 64, buffer + 7, 32);
+	xwing_shake256(coins, 64, seed, 32);
+	memset(seed, 0, sizeof(seed));
 
 	// Deterministic keygen
 	uint8_t *sk = ctap_buffer;
@@ -1947,13 +2005,16 @@ void okcrypto_xwing_keygen (uint8_t *buffer) {
 	}
 
 	// Generate 32-byte seed, store via existing ECC slot infrastructure
+	uint8_t seed[XWING_SEED_SIZE];
 	RNG2(buffer + 7, XWING_SEED_SIZE);
+	memcpy(seed, buffer + 7, XWING_SEED_SIZE); // ecc_priv_flash() below encrypts buffer+7 in place (gcm.encrypt(state,state,len)) - keep the plaintext for the expansion below
 	buffer[6] = (KEYTYPE_XWING & 0x0F) | 0x20; // type with decrypt feature (bit 5)
-	ecc_priv_flash(buffer, false);
+	ecc_priv_flash(buffer, false, true); // quiet: the public key below IS the response
 
 	// Expand seed: SHAKE256(seed, 96)
 	uint8_t expanded[96];
-	xwing_shake256(expanded, 96, buffer + 7, XWING_SEED_SIZE);
+	xwing_shake256(expanded, 96, seed, XWING_SEED_SIZE);
+	memset(seed, 0, sizeof(seed));
 
 	// ML-KEM-768 deterministic keygen from expanded[0:64]
 	uint8_t *sk_M = ctap_buffer;

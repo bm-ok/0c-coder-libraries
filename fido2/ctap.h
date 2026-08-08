@@ -156,7 +156,16 @@ extern "C"
 #define NEW_PIN_MAX_SIZE            64
 #define NEW_PIN_MIN_SIZE            4
 
-#define CTAP_RESPONSE_BUFFER_SIZE   4096
+// 2048, not 4096. CTAP_RESPONSE is a STACK LOCAL in ctaphid_handle_packet()
+// (ctaphid.cpp) and this array is nearly all of it, on top of ctap_request() ->
+// ctap_get_assertion() -> sigder[514] plus CBOR and ECC scratch beneath. That
+// stack has under 1KB of headroom - proven by OKCONNECT hanging when globals
+// grew by exactly 1KB and passing when the same change was made RAM-neutral.
+// Halving this frees 2048 bytes of STACK, which is the direction with room, so
+// large_resp_buffer can afford the 3328 bytes an ML-DSA-65 signature needs.
+// Responses on this device never approach 2048: the largest is retrieved in
+// MAX_LARGE_RESP_CHUNK (512) pieces.
+#define CTAP_RESPONSE_BUFFER_SIZE   2048
 
 #define PIN_LOCKOUT_ATTEMPTS        8       // Number of attempts total
 #define PIN_BOOT_ATTEMPTS           3       // number of attempts per boot

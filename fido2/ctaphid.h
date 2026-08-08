@@ -57,7 +57,7 @@ extern "C"
 
 #define CTAPHID_BROADCAST_CID       0xffffffff
 
-#define CTAPHID_BUFFER_SIZE         7609
+#define CTAPHID_BUFFER_SIZE         6585
 
 #define CAPABILITY_WINK             0x01
 #define CAPABILITY_LOCK             0x02

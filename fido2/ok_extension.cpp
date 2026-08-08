@@ -98,6 +98,22 @@
 
 extern uint8_t* large_resp_buffer;
 extern int large_resp_buffer_offset;
+extern int large_resp_buffer_cursor;
+extern uint8_t large_resp_buffer_last_opt3;
+// Max bytes of large_resp_buffer served per WebAuthn round trip.
+//
+// The destination is ctap.cpp's sigder[514]: extend_fido2() puts a status byte
+// at sigder[0] and the payload from sigder+1, and ctap_end_get_assertion()
+// requires sigder_sz (= payload + 1) to be strictly less than sizeof(sigder).
+// So the largest payload that survives is 512, not 513 - at 513 the size test
+// fails and the response silently drops to the 72-byte default.
+//
+// 512 is also exactly an RSA-4096 signature, which keeps the classic PGP path
+// single-shot. That matters because that path cannot reassemble: onlykey-pgp.js's
+// doPinTimer() resolves on the first poll returning an array. Only responses
+// genuinely larger than one assertion (ML-DSA-65's 3309 bytes) chunk, and only
+// callers that accumulate should ask for them.
+#define MAX_LARGE_RESP_CHUNK 512
 extern uint8_t profilemode;
 extern uint8_t isfade;
 extern uint8_t NEO_Color;
@@ -111,6 +127,33 @@ extern uint8_t pending_operation;
 extern int packet_buffer_offset;
 extern uint8_t packet_buffer_details[5];
 uint8_t transit_key[32];
+
+// Duplicate-packet suppression high-water mark for inbound OKDECRYPT/OKSIGN
+// requests (the Windows 10 1903 double-fire guard).
+//
+// This used to be kept in packet_buffer_details[3] - which okcore.cpp's
+// process_packets() overwrites with TWO RANDOM BYTES the moment a message
+// completes:
+//
+//     RNG2(packet_buffer_details + 3, 2);   // response channel id
+//
+// Two unrelated meanings on one byte, and the random one wins. The next
+// multi-chunk request then arrives against a random 0-255 threshold, so its
+// early chunks fail `opt3 <= last` and are dropped SILENTLY - no error, no
+// print. The device accumulates only the chunks that happened to exceed the
+// random byte, hashes that short buffer, and asks for challenge digits
+// computed over bytes the host never sent.
+//
+// Measured 2026-08-01: a 1088-byte ML-KEM-768 ciphertext sent as five
+// 228-byte chunks arrived as its final 176-byte chunk ALONE (1088 - 4*228),
+// confirmed by the "Received Message" byteprint, and every confirmation
+// failed with "Error incorrect challenge was entered".
+//
+// This affects the classic RSA path identically - any payload needing more
+// than one keyhandle. It goes unnoticed there because wipetasks() zeroes the
+// byte on a 5s timer, and a human operating the web app usually takes longer
+// than that between operations; a scripted caller does not.
+static uint8_t last_request_opt3 = 0;
 
 
 int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint8_t * output) {
@@ -200,35 +243,63 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 				uint8_t additional_data[33] = {0};
 				if (opt1 == DERIVE_PUBLIC_KEY_REQ_PRESS || opt1 == DERIVE_SHAREDSEC_REQ_PRESS) {
 					additional_data[0] = 1; // Generate different key for REQ_PRESS than non REQ_PRESS
-				} else if (!(is_bit_set(derived_key_challenge_mode, 3))) {
-					//derived keys per site without touch not enabeled
-					ret = CTAP2_ERR_EXTENSION_NOT_SUPPORTED; //APPID doesn't match
-					wipedata();
-					return ret;
+				} else {
+					// derived_key_challenge_mode is a RAM cache of an EEPROM
+					// byte, unconditionally zeroed by wipetasks() and by every
+					// done_process_packets() call (the OnlyKey raw-HID
+					// pipeline - PIN unlock, status, OKCONNECT, SSH/GPG - a
+					// completely separate dispatch path from this FIDO2/CTAP
+					// one), and only reloaded there for slot codes >200 (an
+					// SSH/GPG-specific convention, okcrypto.cpp:207/369/650)
+					// that this FIDO2 path never sends. So the RAM copy is
+					// essentially always stale by the time this check runs,
+					// regardless of what's actually persisted in EEPROM.
+					// Reload directly here instead of trusting the cache -
+					// okeeprom_eeget_derived_key_challenge_mode() is a plain
+					// single-byte eeprom_read_byte(), no side effects.
+					okeeprom_eeget_derived_key_challenge_mode(&derived_key_challenge_mode);
+					if (!(is_bit_set(derived_key_challenge_mode, 3))) {
+						//derived keys per site without touch not enabeled
+						ret = CTAP2_ERR_EXTENSION_NOT_SUPPORTED; //APPID doesn't match
+						wipedata();
+						return ret;
+					}
 				}
 				memcpy(additional_data+1, client_handle+43, 32); // 32 bytes of data to include in key derivation
 				opt2++;
 				memset(ecc_public_key, 0, sizeof(ecc_public_key));
 
 				// ---- X-Wing (mlkem768x25519) split custody -------------------
-				// UNTESTED — validate on hardware. Wire keytype 5 -> opt2==KEYTYPE_XWING(6).
-				// Returns 64 bytes, encrypted under the transit key when opt3:
+				// Wire keytype 5 -> opt2==KEYTYPE_XWING(6). Returns 64 bytes,
+				// encrypted under the transit key when opt3:
 				//   DERIVE_PUBLIC_KEY -> [ pk_X(32) | mlkem_seed(32) ]
 				//   DERIVE_SHAREDSEC  -> [ ss_X(32) | mlkem_seed(32) ]
 				// sk_X (X25519) never leaves the device; the browser expands
-				// mlkem_seed and does the ML-KEM half locally. See
-				// onlykey.github.io src/plugins/age/INTEGRATION.md.
+				// mlkem_seed and does the ML-KEM half locally.
+				//
+				// Calls the SAME okcrypto_xwing_web_derive() the raw-HID path
+				// uses (okcrypto.cpp's okcrypto_getpubkey/okcrypto_decrypt,
+				// already proven correct against the CLI - TC-16/TC-17) rather
+				// than re-deriving inline, after finding live (TC-18/TC-19,
+				// browser<->CLI interop) that an earlier inline copy here
+				// produced a DIFFERENT sk_X than the CLI for the same label:
+				// okcrypto_hkdf() folds whatever RPID string is staged at
+				// ctap_buffer+4 into the derivation, and the raw-HID path
+				// explicitly stages "onlyagent.app" there
+				// (okcrypto_xwing_web_derive itself) before deriving, but this
+				// FIDO2 dispatch path never did - it derived using whatever
+				// RPID happened to already be in ctap_buffer from the
+				// surrounding CTAP2 request instead. Calling the shared
+				// function fixes that by construction and removes the
+				// duplicate-implementation drift risk entirely. This also
+				// means X-Wing derives the same key regardless of REQ_PRESS
+				// (okcrypto_xwing_web_derive has no such distinction, matching
+				// the CLI path, which never had one either) - unlike the
+				// generic EC keytypes below, whose REQ_PRESS/non-REQ_PRESS
+				// separation this doesn't touch.
 				if (opt2 == KEYTYPE_XWING) {
-					// sk_X + pk_X from the web-derivation key (same as CURVE25519 path)
-					okcrypto_derive_key(KEYTYPE_CURVE25519, additional_data, RESERVED_KEY_WEB_DERIVATION);
-					// mlkem_seed = SHA256( sk_X || tag ) : one-way, domain-separated (!= sk_X)
-					uint8_t xwing_seed[32];
-					const char xwtag[] = "onlykey/xwing/mlkem768-seed/v1";
-					SHA256_CTX xc; sha256_init(&xc);
-					sha256_update(&xc, ecc_private_key, 32);
-					sha256_update(&xc, (const uint8_t*)xwtag, sizeof(xwtag) - 1);
-					sha256_final(&xc, xwing_seed);
 					uint8_t *xout = temp + 32 + sizeof(UNLOCKED) + 1;
+					uint8_t *label32 = client_handle + 43;
 					if (opt1 == DERIVE_SHAREDSEC || opt1 == DERIVE_SHAREDSEC_REQ_PRESS) {
 						if (opt1 == DERIVE_SHAREDSEC_REQ_PRESS) {
 							int but;
@@ -238,19 +309,14 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 							else if (but < 0) return CTAP2_ERR_KEEPALIVE_CANCEL;
 							else if (but == 0) { pending_operation = 0; return CTAP2_ERR_ACTION_TIMEOUT; }
 						}
-						// ss_X = X25519(sk_X, ct_X); ct_X = input pubkey from the age stanza
+						// ct_X = input pubkey from the age stanza
 						uint8_t *ct_X = client_handle + 43 + 32;
-						if (okcrypto_shared_secret(ct_X, xout)) {
-							ret = CTAP2_ERR_OPERATION_DENIED;
-							printf2(TAG_ERR, "Error with X-Wing ss_X\n");
-							return ret;
-						}
+						okcrypto_xwing_web_derive(label32, ct_X, xout);
 					} else {
-						memcpy(xout, ecc_public_key, 32); // pk_X
+						okcrypto_xwing_web_derive(label32, NULL, xout);
 					}
-					memcpy(xout + 32, xwing_seed, 32);    // mlkem_seed
 					send_transport_response(temp, 32 + sizeof(UNLOCKED) + 1 + 64, opt3, false);
-					ret = send_stored_response(output);
+					ret = send_stored_response(output, opt3);
 					return ret;
 				}
 
@@ -292,7 +358,7 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 					if (os == 'W' && packet_buffer_details[3] == 'W') {
 						// Already generated shared secret, Windows duplicate request
 						packet_buffer_details[3] = 0; 
-						ret = send_stored_response(output);
+						ret = send_stored_response(output, opt3);
 						return ret;
 					}
 					else { 
@@ -328,9 +394,13 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 						byteprint(temp+32+sizeof(UNLOCKED)+1+pubsize, 32);
 						#endif
 						send_transport_response(temp, 32+sizeof(UNLOCKED)+1+pubsize+sizeof(ecc_private_key), opt3, false); // Encrypt data in trasit using transit key if opt3 and send right away
+						ret = send_stored_response(output, opt3);
+						return ret;
 					}
 				} else { // Just Return DERIVE_PUBLIC_KEY
 					send_transport_response(temp, 32+sizeof(UNLOCKED)+1+pubsize, opt3, false); //Encrypt if opt3 and send right away
+					ret = send_stored_response(output, opt3);
+					return ret;
 				}
 			} else {
 				send_transport_response (temp, 32+sizeof(UNLOCKED)+1, opt3, false); //Encrypt if opt3 and send right away
@@ -360,8 +430,8 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 			// Break the FIDO message into packets
 			else if (!CRYPTO_AUTH) {
 				int i=0;
-				if (!packet_buffer_details[3]) packet_buffer_details[3] = opt3; // first packet
-				else if (opt3 <= packet_buffer_details[3]) return 0; // duplicate packet, thanks to win 10 1903 sending all FIDO2 messages twice
+				if (!last_request_opt3) last_request_opt3 = opt3; // first packet
+				else if (opt3 <= last_request_opt3) return 0; // duplicate packet, thanks to win 10 1903 sending all FIDO2 messages twice
 
 				while(handle_len>0) { // Max size packet minus header
 					memset(recv_buffer, 0, sizeof(recv_buffer));
@@ -373,7 +443,7 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 					recv_buffer[6] = 0xFF;
 					if (opt2 && handle_len<=57) recv_buffer[6] = handle_len; // last packet
 					if (cmd == OKDECRYPT) {
-						packet_buffer_details[3] = opt3;
+						last_request_opt3 = opt3;
 						NEO_Color = 128; //Turquoise
 						large_buffer_offset = 0;
 						outputmode=WEBAUTHN;
@@ -383,7 +453,7 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 						#endif
 						okcrypto_decrypt(recv_buffer);
 					} else if (cmd == OKSIGN) {
-						packet_buffer_details[3] = opt3;
+						last_request_opt3 = opt3;
 						NEO_Color = 213; //Purple
 						large_buffer_offset = 0;
 						outputmode=WEBAUTHN;
@@ -396,10 +466,13 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 					handle_len-=57;
 					i++;
 				}
+				// opt2 marked this the final chunk, so the message is complete
+				// and the next one must start from a clean high-water mark.
+				if (opt2) last_request_opt3 = 0;
 				ret = 0;
 				}
 		}
-		ret = send_stored_response(output);
+		ret = send_stored_response(output, opt3);
 		return ret;
 			
 		//if (!isfade) fadeon(NEO_Color);
@@ -410,7 +483,7 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
     return ret;
 }
 
-int16_t send_stored_response(uint8_t * output) {
+int16_t send_stored_response(uint8_t * output, uint8_t opt3) {
   int16_t ret = 0;
 	if(profilemode!=NONENCRYPTEDPROFILE) {
 		#ifdef DEBUG
@@ -425,15 +498,39 @@ int16_t send_stored_response(uint8_t * output) {
 			#endif
 			ret = CTAP2_ERR_OPERATION_PENDING;
 		} else if (large_resp_buffer_offset) {
-			extension_writeback_init(output, large_resp_buffer_offset);
-			extension_writeback(large_resp_buffer, large_resp_buffer_offset);
+			// Chunked retrieval: large_resp_buffer_offset can exceed what one
+			// WebAuthn assertion carries (a 3309 B ML-DSA-65 signature vs.
+			// ~513 B usable), so a full response may take several OKPING
+			// polls. large_resp_buffer_cursor tracks what has been delivered.
+			//
+			// opt3 <= large_resp_buffer_last_opt3 means this poll duplicates
+			// the one just answered (the Windows 10 1903 double-fire this file
+			// guards against elsewhere via packet_buffer_details[3]) - re-serve
+			// the same bytes rather than advancing, or a duplicate silently
+			// skips a chunk and corrupts the reassembled response.
+			int is_duplicate = large_resp_buffer_last_opt3 && opt3 <= large_resp_buffer_last_opt3;
+			int chunk_start = is_duplicate
+				? (large_resp_buffer_cursor > MAX_LARGE_RESP_CHUNK ? large_resp_buffer_cursor - MAX_LARGE_RESP_CHUNK : 0)
+				: large_resp_buffer_cursor;
+			int remaining = large_resp_buffer_offset - chunk_start;
+			int chunk_len = remaining > MAX_LARGE_RESP_CHUNK ? MAX_LARGE_RESP_CHUNK : remaining;
+			extension_writeback_init(output, chunk_len);
+			extension_writeback(large_resp_buffer + chunk_start, chunk_len);
+			if (!is_duplicate) {
+				large_resp_buffer_cursor = chunk_start + chunk_len;
+				large_resp_buffer_last_opt3 = opt3;
+			}
 			// Windows 10 1903 bug, it sends every fido2 request/response twice
 			// Everything happens twice, and the computer only pays attention to the 2nd request/response.
 			// This means we can't wipe the response after it's retrieved, have to wipe
 			// based on a timer
 			//memset(large_resp_buffer, 0, LARGE_RESP_BUFFER_SIZE);
-			wipedata(); // Wipe timer started
-			pending_operation=CTAP2_ERR_DATA_WIPE;
+			wipedata(); // Wipe timer started/extended while chunks remain
+			if (large_resp_buffer_cursor >= large_resp_buffer_offset) {
+				pending_operation=CTAP2_ERR_DATA_WIPE;
+				large_resp_buffer_cursor = 0;
+				large_resp_buffer_last_opt3 = 0;
+			}
 		} else if (CRYPTO_AUTH || packet_buffer_offset) {
 			#ifdef DEBUG
 			Serial.println("Ping success");
@@ -448,8 +545,12 @@ int16_t send_stored_response(uint8_t * output) {
       		ret = CTAP2_ERR_NO_OPERATION_PENDING;
 			fadeoff(1);
 		}
-		return ret; 
+		return ret;
 	}
+	// The whole body above is inside `if (profilemode != NONENCRYPTEDPROFILE)`,
+	// so a non-encrypted profile falls off the end of a non-void function. ret
+	// is still 0 on that path, which is what the inner return would produce.
+	return ret;
 }
 
 #endif

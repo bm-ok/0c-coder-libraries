@@ -140,6 +140,7 @@ extern void okcrypto_mlkem_getpubkey (uint8_t *buffer);
 extern void okcrypto_xwing_keygen (uint8_t *buffer);
 extern void okcrypto_xwing_decaps (uint8_t *buffer);
 extern void okcrypto_xwing_getpubkey (uint8_t *buffer);
+extern void okcrypto_xwing_web_derive (uint8_t *label32, uint8_t *ct_x, uint8_t *out64);
 
 
 #ifdef __cplusplus

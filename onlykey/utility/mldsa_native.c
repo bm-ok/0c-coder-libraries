@@ -57,49 +57,49 @@
  * ```
  */
 
-#include "src/common.h"
+#include "mldsa_src/common.h"
 
-#include "src/ct.c"
-#include "src/debug.c"
-#include "src/packing.c"
-#include "src/poly.c"
-#include "src/poly_kl.c"
-#include "src/polyvec.c"
-#include "src/polyvec_lazy.c"
-#include "src/sign.c"
+#include "mldsa_src/ct.c"
+#include "mldsa_src/debug.c"
+#include "mldsa_src/packing.c"
+#include "mldsa_src/poly.c"
+#include "mldsa_src/poly_kl.c"
+#include "mldsa_src/polyvec.c"
+#include "mldsa_src/polyvec_lazy.c"
+#include "mldsa_src/sign.c"
 
 #if !defined(MLD_CONFIG_FIPS202_CUSTOM_HEADER)
-#include "src/fips202/fips202.c"
-#include "src/fips202/fips202x4.c"
-#include "src/fips202/keccakf1600.c"
+#include "mldsa_src/fips202/fips202.c"
+#include "mldsa_src/fips202/fips202x4.c"
+#include "mldsa_src/fips202/keccakf1600.c"
 #endif
 
 #if defined(MLD_CONFIG_USE_NATIVE_BACKEND_ARITH)
 #if defined(MLD_SYS_AARCH64)
-#include "src/native/aarch64/src/aarch64_zetas.c"
-#include "src/native/aarch64/src/polyz_unpack_table.c"
-#include "src/native/aarch64/src/rej_uniform_eta_table.c"
-#include "src/native/aarch64/src/rej_uniform_table.c"
+#include "mldsa_src/native/aarch64/src/aarch64_zetas.c"
+#include "mldsa_src/native/aarch64/src/polyz_unpack_table.c"
+#include "mldsa_src/native/aarch64/src/rej_uniform_eta_table.c"
+#include "mldsa_src/native/aarch64/src/rej_uniform_table.c"
 #endif /* MLD_SYS_AARCH64 */
 #if defined(MLD_SYS_X86_64)
-#include "src/native/x86_64/src/consts.c"
-#include "src/native/x86_64/src/rej_uniform_avx2.c"
-#include "src/native/x86_64/src/rej_uniform_eta2_avx2.c"
-#include "src/native/x86_64/src/rej_uniform_eta4_avx2.c"
-#include "src/native/x86_64/src/rej_uniform_table.c"
+#include "mldsa_src/native/x86_64/src/consts.c"
+#include "mldsa_src/native/x86_64/src/rej_uniform_avx2.c"
+#include "mldsa_src/native/x86_64/src/rej_uniform_eta2_avx2.c"
+#include "mldsa_src/native/x86_64/src/rej_uniform_eta4_avx2.c"
+#include "mldsa_src/native/x86_64/src/rej_uniform_table.c"
 #endif /* MLD_SYS_X86_64 */
 #endif /* MLD_CONFIG_USE_NATIVE_BACKEND_ARITH */
 
 #if defined(MLD_CONFIG_USE_NATIVE_BACKEND_FIPS202)
 #if defined(MLD_SYS_AARCH64)
-#include "src/fips202/native/aarch64/src/keccakf1600_round_constants.c"
+#include "mldsa_src/fips202/native/aarch64/src/keccakf1600_round_constants.c"
 #endif
 #if defined(MLD_SYS_X86_64)
-#include "src/fips202/native/x86_64/src/keccakf1600_constants.c"
+#include "mldsa_src/fips202/native/x86_64/src/keccakf1600_constants.c"
 #endif
 #if defined(MLD_SYS_ARMV81M_MVE)
-#include "src/fips202/native/armv81m/src/keccak_f1600_x4_mve.c"
-#include "src/fips202/native/armv81m/src/keccakf1600_round_constants.c"
+#include "mldsa_src/fips202/native/armv81m/src/keccak_f1600_x4_mve.c"
+#include "mldsa_src/fips202/native/armv81m/src/keccakf1600_round_constants.c"
 #endif
 #endif /* MLD_CONFIG_USE_NATIVE_BACKEND_FIPS202 */
 

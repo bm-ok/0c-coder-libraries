@@ -115,7 +115,18 @@ bool Password::profile1hashevaluate(){
 	uint8_t temp[32];
 	uint8_t KEK[32];
 	uint8_t nonce2[32];
+#ifdef OK_EMULATOR
+	/* GCC rejects two block-scope declarations of the same entity in one
+	   translation unit disagreeing on type - profile2hashevaluate() below
+	   spells this `uint8_t`. okcore.cpp actually DEFINES it as `int`, so both
+	   spellings in this file are wrong; making them agree is the minimal change
+	   that compiles. Gated rather than corrected because declaring them `int`
+	   would change what the device reads back from a negative Profile_Offset
+	   (OnlyKey.ino assigns -42, seen as 214 through the uint8_t spelling). */
+	extern uint8_t Profile_Offset;
+#else
 	extern int Profile_Offset;
+#endif
 	extern uint8_t onlykeyhw;
 	extern uint8_t Duo_config[2];
 

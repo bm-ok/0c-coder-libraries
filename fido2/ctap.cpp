@@ -1330,12 +1330,51 @@ uint8_t ctap_end_get_assertion(CborEncoder * map, CTAP_credentialDescriptor * cr
 	// OnlyKey required change start
     if ( extend_fido2(&cred->credential.id, &cred->type, sigder) )
     {
-        extern int large_resp_buffer_offset;
-        extern uint8_t pending_operation;
-        if ((pending_operation==CTAP2_ERR_DATA_READY || pending_operation==CTAP2_ERR_DATA_WIPE) && large_resp_buffer_offset+1< sizeof(sigder)) {
-            sigder_sz=large_resp_buffer_offset+1;
+        // Size the response from what extension_writeback() ACTUALLY wrote into
+        // sigder, and from nothing else.
+        //
+        // large_resp_buffer_offset cannot be used: it is the length of the whole
+        // stored response, which stops matching the assertion the moment
+        // send_stored_response() starts serving that response in chunks.
+        //
+        // pending_operation cannot be used either, and that is the subtler trap.
+        // It is a global owned by a different code path: process_packets()
+        // (okcore.cpp) resets it to CTAP2_ERR_NO_OPERATION_PENDING on every
+        // inbound raw-HID packet, which includes the CTAPHID packets carrying
+        // these very polls. So by the time this runs it no longer describes the
+        // request in hand.
+        //
+        // Gating on it therefore split by response SIZE, which looks nothing
+        // like the actual cause. A response small enough to fit one chunk is
+        // finished inside send_stored_response(), which sets
+        // pending_operation = CTAP2_ERR_DATA_WIPE before returning, so the gate
+        // passed; a partial chunk sets nothing, so the gate saw the clobbered
+        // value and fell to the 72-byte default. Measured live 2026-08-01: a
+        // 3309-byte ML-DSA-65 signature staged correctly and served in 512-byte
+        // chunks arrived at the host as 71 bytes per chunk - staged bytes 0..70,
+        // then 512..582, the cursor advancing a full 512 each time. The host
+        // reassembled one byte in seven of the real signature, and no framing
+        // could verify it. The 64-byte Ed25519 half over the identical path was
+        // unaffected, which is what made this look like a large-buffer problem
+        // for as long as it did.
+        //
+        // output_buffer_size is what the extension DECLARED for this request:
+        // solo.cpp's OnlyKey dispatch declares 0 up front and
+        // send_stored_response() re-declares the chunk length when it has bytes.
+        // 0 therefore means "this poll found nothing to serve" - ship the status
+        // byte alone rather than 71 bytes of uninitialised sigder[] stack, which
+        // the host would otherwise read as payload behind a success status.
+        //
+        // extend_fido2() puts a status byte at output[0] and the payload from
+        // output+1, hence the +1.
+        extern uint16_t output_buffer_offset;
+        extern uint16_t output_buffer_size;
+        if (output_buffer_size == 0) {
+            sigder_sz = 1;
+        } else if (output_buffer_offset && output_buffer_offset+1 <= (int)sizeof(sigder)) {
+            sigder_sz=output_buffer_offset+1;
             printf1(TAG_GA,"sigder");
-            dump_hex1(TAG_GA, sigder,large_resp_buffer_offset);
+            dump_hex1(TAG_GA, sigder, output_buffer_offset);
         } else sigder_sz = 72;
     // OnlyKey required change end
     }

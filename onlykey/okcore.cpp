@@ -5534,13 +5534,19 @@ void rsa_priv_flash(uint8_t *buffer, bool wipe)
 		Serial.println(buffer[6]);
 	#endif
 	}
+	//The last report of a key carries fewer than a full 57 bytes, and the bytes
+	//past a key are not its own - rsa_private_key also has no room past
+	//MAX_RSA_KEY_SIZE, which a 512 byte key fills exactly
 	if ((buffer[6] & 0x0F) == 1) //Expect 128 Bytes, if buffer[0] != FF we know this is import from backup
 	{
 		keysize = 128;
 		if (buffer[0] != 0xBA && packet_buffer_offset <= 114)
 		{
-			memcpy(rsa_private_key + packet_buffer_offset, buffer + 7, 57);
-			packet_buffer_offset = packet_buffer_offset + 57;
+			int chunk = keysize - packet_buffer_offset;
+			if (chunk > 57)
+				chunk = 57;
+			memcpy(rsa_private_key + packet_buffer_offset, buffer + 7, chunk);
+			packet_buffer_offset = packet_buffer_offset + chunk;
 		}
 	}
 	else if ((buffer[6] & 0x0F) == 2)
@@ -5548,8 +5554,11 @@ void rsa_priv_flash(uint8_t *buffer, bool wipe)
 		keysize = 256;
 		if (buffer[0] != 0xBA && packet_buffer_offset <= 228)
 		{
-			memcpy(rsa_private_key + packet_buffer_offset, buffer + 7, 57);
-			packet_buffer_offset = packet_buffer_offset + 57;
+			int chunk = keysize - packet_buffer_offset;
+			if (chunk > 57)
+				chunk = 57;
+			memcpy(rsa_private_key + packet_buffer_offset, buffer + 7, chunk);
+			packet_buffer_offset = packet_buffer_offset + chunk;
 		}
 	}
 	else if ((buffer[6] & 0x0F) == 3)
@@ -5557,8 +5566,11 @@ void rsa_priv_flash(uint8_t *buffer, bool wipe)
 		keysize = 384;
 		if (buffer[0] != 0xBA && packet_buffer_offset <= 342)
 		{
-			memcpy(rsa_private_key + packet_buffer_offset, buffer + 7, 57);
-			packet_buffer_offset = packet_buffer_offset + 57;
+			int chunk = keysize - packet_buffer_offset;
+			if (chunk > 57)
+				chunk = 57;
+			memcpy(rsa_private_key + packet_buffer_offset, buffer + 7, chunk);
+			packet_buffer_offset = packet_buffer_offset + chunk;
 		}
 	}
 	else if ((buffer[6] & 0x0F) == 4)
@@ -5566,8 +5578,11 @@ void rsa_priv_flash(uint8_t *buffer, bool wipe)
 		keysize = 512;
 		if (buffer[0] != 0xBA && packet_buffer_offset <= 456)
 		{
-			memcpy(rsa_private_key + packet_buffer_offset, buffer + 7, 57);
-			packet_buffer_offset = packet_buffer_offset + 57;
+			int chunk = keysize - packet_buffer_offset;
+			if (chunk > 57)
+				chunk = 57;
+			memcpy(rsa_private_key + packet_buffer_offset, buffer + 7, chunk);
+			packet_buffer_offset = packet_buffer_offset + chunk;
 		}
 	}
 	else if ((buffer[6] & 0x0F) == KEYTYPE_PQC_PGP)
@@ -5575,8 +5590,11 @@ void rsa_priv_flash(uint8_t *buffer, bool wipe)
 		keysize = PQC_PGP_BLOB_LEN;
 		if (buffer[0] != 0xBA && packet_buffer_offset < PQC_PGP_BLOB_LEN)
 		{
-			memcpy(rsa_private_key + packet_buffer_offset, buffer + 7, 57);
-			packet_buffer_offset = packet_buffer_offset + 57;
+			int chunk = keysize - packet_buffer_offset;
+			if (chunk > 57)
+				chunk = 57;
+			memcpy(rsa_private_key + packet_buffer_offset, buffer + 7, chunk);
+			packet_buffer_offset = packet_buffer_offset + chunk;
 		}
 	}
 	else
@@ -5599,6 +5617,10 @@ void rsa_priv_flash(uint8_t *buffer, bool wipe)
 		Serial.print("RSA Key value =");
 		byteprint((uint8_t *)rsa_private_key, keysize);
 		#endif
+		//All MAX_RSA_KEY_SIZE bytes of the slot reach flash while only keysize of
+		//them are encrypted, and the rest still hold the last key decrypted into
+		//this global by okcore_flashget_RSA()
+		memset(rsa_private_key + keysize, 0, MAX_RSA_KEY_SIZE - keysize);
 		okcore_aes_gcm_encrypt(rsa_private_key, buffer[5], buffer[6], profilekey, keysize);
 		//Copy current flash contents to buffer
 		okcore_flashget_common(tptr, (unsigned long *)adr, 2048);

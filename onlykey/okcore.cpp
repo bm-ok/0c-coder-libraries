@@ -508,6 +508,18 @@ void recvmsg(int n)
 					#endif
 				}
 			}
+			else if (initialized == true && unlocked == true && FTFL_FSEC == 0x44 && integrityctr1 == integrityctr2 && configmode == false)
+			{
+				// Same state OKSETPRIV reports as "not in config mode" above. Without
+				// this branch an unlocked device fell through to the shared "device
+				// locked" below, so the two key commands blamed different things in
+				// one state and a host relayed "unlock your key" to a user whose key
+				// was already unlocked. Reports only - the set of states in which a
+				// wipe is performed is unchanged, and a failed integrity check still
+				// falls through to the else and fails closed.
+				hidprint("Error not in config mode");
+				return;
+			}
 			else
 			{
 				hidprint("Error device locked");

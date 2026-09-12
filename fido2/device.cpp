@@ -122,7 +122,7 @@ int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
     appid_match1 = memcmp (stored_apprpid, rpid, 12);
 	appid_match2 = memcmp (stored_appid, _appid, 32);
 	int appid_match3 = memcmp (stored_appid_oa, _appid, 32); //OnlyAgent origin (onlyagent.app)
-    if ((appid_match1 == 0 || appid_match2 == 0 || appid_match3 == 0) && !(is_bit_set(derived_key_challenge_mode, 1))) {
+    if ((appid_match1 == 0 || appid_match2 == 0 || appid_match3 == 0) && !(is_bit_set(derived_key_challenge_mode, 5))) {
         // A trusted origin now gets DERIVED-KEY access only (return 1) unless the
         // user has explicitly opted in to stored-key operations over FIDO2 with
         // bit 4. Level 2 is what unlocks the OKDECRYPT/OKSIGN tunnel in
@@ -138,6 +138,19 @@ int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
         // neither, so they do not belong behind the same switch.
         //
         // Default (mode byte 0) is therefore: derive yes, PGP no.
+        //
+        // Field 21 layout, after reconciling with the user-input-mode enum:
+        //   value & 0x0F   input mode enum: 0 challenge code, 1 button press, 2 none
+        //   0x10  bit 4    allow stored-key (PGP) use over FIDO2
+        //   0x20  bit 5    disable the FIDO2 extension entirely
+        //   0x40 0x80      reserved
+        // The enum owns the low nibble, flags own the high nibble, so the two
+        // cannot collide. The kill switch moved from bit 1 to bit 5 for exactly
+        // that reason: bit 1 IS enum value 2, so a device set to "no
+        // confirmation required" would otherwise read here as "extension
+        // disabled", and a device with the old kill switch set would read as
+        // "no confirmation required" - failing open, which is the wrong
+        // direction.
         return is_bit_set(derived_key_challenge_mode, 4) ? 2 : 1;
     }
     // The bit 2 escape hatch is GONE. It let an origin that matches NONE of the

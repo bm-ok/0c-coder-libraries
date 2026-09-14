@@ -105,6 +105,15 @@ int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
     // eeprom_read_byte() with no side effects. ok_extension.cpp used to do this
     // reload for the same reason, in code this change removed.
     okeeprom_eeget_derived_key_challenge_mode(&derived_key_challenge_mode);
+    // Normalize before testing any bit. A stored byte may predate the
+    // enum+flags layout, and okcore_derived_mode_normalize() is where the
+    // legacy readings are pinned down - notably that legacy value 2 meant
+    // "extension disabled" and must never be read as the enum's "no
+    // confirmation required". Doing the translation here rather than in a
+    // release note is the whole point: a key in a drawer does not read
+    // release notes.
+    uint8_t ok_mode = 0, ok_flags = 0;
+    okcore_derived_mode_normalize(derived_key_challenge_mode, &ok_mode, &ok_flags);
     #ifdef DEBUG
 	Serial.println("Ctap buffer:");
     byteprint(ctap_buffer, 12);
@@ -122,7 +131,7 @@ int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
     appid_match1 = memcmp (stored_apprpid, rpid, 12);
 	appid_match2 = memcmp (stored_appid, _appid, 32);
 	int appid_match3 = memcmp (stored_appid_oa, _appid, 32); //OnlyAgent origin (onlyagent.app)
-    if ((appid_match1 == 0 || appid_match2 == 0 || appid_match3 == 0) && !(is_bit_set(derived_key_challenge_mode, 5))) {
+    if ((appid_match1 == 0 || appid_match2 == 0 || appid_match3 == 0) && !(ok_flags & OKMODE_FLAG_DISABLE_EXT)) {
         // A trusted origin now gets DERIVED-KEY access only (return 1) unless the
         // user has explicitly opted in to stored-key operations over FIDO2 with
         // bit 4. Level 2 is what unlocks the OKDECRYPT/OKSIGN tunnel in
@@ -139,19 +148,13 @@ int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
         //
         // Default (mode byte 0) is therefore: derive yes, PGP no.
         //
-        // Field 21 layout, after reconciling with the user-input-mode enum:
-        //   value & 0x0F   input mode enum: 0 challenge code, 1 button press, 2 none
+        // Field 21 layout (see okcore.h / okcore_derived_mode_normalize):
+        //   value & 0x0F   input mode: 0 challenge code, 1 button press,
+        //                  2 RESERVED (legacy "disable extension"), 3 none
         //   0x10  bit 4    allow stored-key (PGP) use over FIDO2
         //   0x20  bit 5    disable the FIDO2 extension entirely
         //   0x40 0x80      reserved
-        // The enum owns the low nibble, flags own the high nibble, so the two
-        // cannot collide. The kill switch moved from bit 1 to bit 5 for exactly
-        // that reason: bit 1 IS enum value 2, so a device set to "no
-        // confirmation required" would otherwise read here as "extension
-        // disabled", and a device with the old kill switch set would read as
-        // "no confirmation required" - failing open, which is the wrong
-        // direction.
-        return is_bit_set(derived_key_challenge_mode, 4) ? 2 : 1;
+        return (ok_flags & OKMODE_FLAG_ALLOW_STORED_KEY_FIDO2) ? 2 : 1;
     }
     // The bit 2 escape hatch is GONE. It let an origin that matches NONE of the
     // three hardcoded appids above through at level 1 as long as the message was

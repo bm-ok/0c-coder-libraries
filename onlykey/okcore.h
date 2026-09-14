@@ -215,6 +215,19 @@ extern "C"
 #define RESERVED_KEY_HMACSHA1_1 130
 #define RESERVED_KEY_HMACSHA1_2 129
 #define RESERVED_KEY_WEB_DERIVATION 128
+
+/* Field 21 (derived key mode): user-input-mode enum in the low nibble, policy
+ * flags in the high nibble. See okcore_derived_mode_normalize() in okcore.cpp
+ * for why 2 is reserved and why unknown values fail closed. */
+#define OKMODE_INPUT_MASK                       0x0F
+#define OKMODE_FLAG_MASK                        0xF0
+#define OKMODE_INPUT_CHALLENGE                  0    /* 3-digit challenge code */
+#define OKMODE_INPUT_BUTTON                     1    /* any button press */
+#define OKMODE_INPUT_RESERVED_LEGACY_DISABLE    2    /* never assign: legacy "disable extension" */
+#define OKMODE_INPUT_NONE                       3    /* no confirmation */
+#define OKMODE_FLAG_ALLOW_STORED_KEY_FIDO2      0x10 /* bit 4: PGP over FIDO2 */
+#define OKMODE_FLAG_DISABLE_EXT                 0x20 /* bit 5: no FIDO2 extension at all */
+extern void okcore_derived_mode_normalize (uint8_t raw, uint8_t *mode, uint8_t *flags);
 #define KEYTYPE_NACL 1
 #define KEYTYPE_ED25519 1
 #define KEYTYPE_P256R1 2

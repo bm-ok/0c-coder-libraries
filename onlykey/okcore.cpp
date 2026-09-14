@@ -283,6 +283,62 @@ uint8_t Challenge_button2 = 0;
 uint8_t Challenge_button3 = 0;
 uint8_t CRYPTO_AUTH = 0;
 uint8_t derived_key_challenge_mode = 0;
+
+/* Field 21 (derived key mode) - normalize a stored byte into (mode, flags).
+ *
+ * The byte carries a user-input-mode enum in the low nibble and policy flags in
+ * the high nibble. It ALSO has to survive bytes written by older firmware that
+ * treated the whole thing as a flat bitfield, and that is the hard part: a
+ * device in a drawer keeps whatever byte it was given, and a reinterpretation
+ * that guesses wrong must never guess in the permissive direction.
+ *
+ * Legacy meanings, for reference:
+ *   bit 0 (1)  button press instead of 3-digit challenge code
+ *   bit 1 (2)  disable the FIDO2 extension entirely
+ *   bit 2 (4)  allow OKCONNECT from untrusted origins   (feature removed)
+ *   bit 3 (8)  allow touch-free browser derivation      (feature removed)
+ *
+ * Two rules keep every legacy byte safe without a migration pass, an EEPROM
+ * write, or anyone reading a release note:
+ *
+ * 1. Enum value 2 is RESERVED and never assigned. "No confirmation" is 3.
+ *    Legacy 2 means "extension disabled" - the most restrictive state the byte
+ *    can express - and if 2 were reused for "no confirmation required" then
+ *    every key configured that way would silently become the LEAST restrictive
+ *    state on upgrade. That is the one direction a misread must never take, so
+ *    the value stays reserved and is translated back to what it always meant.
+ *
+ * 2. Any low-nibble value that is not a defined mode falls back to 0, the
+ *    3-digit challenge code, which is the most restrictive input mode. That
+ *    covers legacy 4, 8, 9 and anything else a future or corrupted byte holds.
+ *    Note legacy 8/9 (touch-free derivation) were common: the shipped web app
+ *    needed bit 3 set for its password generator and vault, so real keys carry
+ *    those values. They now land on challenge-code input with touch-free
+ *    derivation gone, which is the safe reading of a setting that no longer
+ *    exists.
+ *
+ * Bits 4 and 5 cannot appear in a legacy byte - legacy only ever used bits 0-3
+ * - so a set bit there can only have come from firmware that meant it.
+ */
+void okcore_derived_mode_normalize (uint8_t raw, uint8_t *mode, uint8_t *flags) {
+	uint8_t m = raw & OKMODE_INPUT_MASK;
+	uint8_t f = raw & OKMODE_FLAG_MASK;
+
+	if (m == OKMODE_INPUT_RESERVED_LEGACY_DISABLE) {
+		/* Legacy "disable the extension". Preserve the intent exactly. */
+		m = OKMODE_INPUT_CHALLENGE;
+		f |= OKMODE_FLAG_DISABLE_EXT;
+	} else if (m != OKMODE_INPUT_CHALLENGE &&
+	           m != OKMODE_INPUT_BUTTON &&
+	           m != OKMODE_INPUT_NONE) {
+		/* Unknown - legacy 4/8/9, or a byte from the future. Fail closed. */
+		m = OKMODE_INPUT_CHALLENGE;
+	}
+
+	if (mode)  *mode  = m;
+	if (flags) *flags = f;
+}
+
 uint8_t stored_key_challenge_mode = 0;
 /*************************************/
 //RNG Assignments

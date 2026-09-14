@@ -18,20 +18,15 @@
 #include "Curve25519.h"
 #include <RNG.h>
 
-/* Arduino compiles each .cpp as its own translation unit, and DEBUG is
- * #define'd in onlykey.h / OnlyKey.ino - neither of which is included here.
- * Every #ifdef DEBUG block in this file was therefore compiling to nothing,
- * giving zero serial visibility into okpqc_sign()/okpqc_decrypt() while
- * looking identical to instrumentation elsewhere that works.
+/* Arduino compiles each .cpp as its own translation unit, so DEBUG has to
+ * reach this file the way it reaches okcore.cpp and okcrypto.cpp: by
+ * including onlykey.h, which is the single build-options switch for the
+ * whole firmware. Without it every #ifdef DEBUG block here compiled to
+ * nothing while looking identical to instrumentation elsewhere that works.
  *
- * NOTE: this forces DEBUG on for this file regardless of build type, so a
- * production (non-DEBUG) build would still compile this file's serial
- * output. Fine for the DEBUG builds this harness drives - it is the only
- * build with the SEREMU channel at all - but it should become a proper
- * conditional include before anything ships. */
-#ifndef DEBUG
-#define DEBUG
-#endif
+ * This file used to #define DEBUG itself, which forced the serial
+ * instrumentation into production builds regardless of build type. */
+#include "onlykey.h"
 
 /* ---- vendored PQC primitives (declared here to avoid pulling the big headers) ---- */
 extern "C" int PQCP_MLKEM_NATIVE_MLKEM768_keypair_derand(uint8_t *pk, uint8_t *dk, const uint8_t *coins /*64B seed*/);
@@ -69,14 +64,13 @@ extern uint8_t packet_buffer_details[];
 extern uint8_t  profilekey[];
 extern uint8_t  ctap_buffer[];           /* large scratch (>= MLDSA_SIG_SIZE 3309) */
 
-extern "C" {
-  void process_packets(uint8_t *buffer, uint8_t type, uint8_t contype);
-  void okcore_aes_gcm_decrypt(uint8_t *state, uint8_t slot, uint8_t features, uint8_t *key, int len);
-  void send_transport_response(uint8_t *data, int len, bool enc, bool storeread);
-  void hidprint(const char *s);
-  void byteprint(uint8_t *bytes, int size);
-  void fadeoff(int);
-}
+/* process_packets(), okcore_aes_gcm_decrypt(), send_transport_response(),
+ * hidprint(), byteprint() and fadeoff() all come from okcore.h (pulled in via
+ * onlykey.h above). This file used to re-declare them locally, and the copies
+ * had drifted from the real signatures - most notably process_packets(), whose
+ * third parameter is a uint8_t* blocknum, not a uint8_t. The calls below pass
+ * 0, which is a null pointer under the real declaration, so it happened to work
+ * on ARM; declaring it correctly removes the trap. */
 
 #ifndef OKDECRYPT_ERR_USER_ACTION_PENDING
 #define OKDECRYPT_ERR_USER_ACTION_PENDING 0xF9

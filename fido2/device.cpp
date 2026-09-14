@@ -93,27 +93,22 @@ int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
     extern uint8_t ctap_buffer[CTAPHID_BUFFER_SIZE];
     extern uint8_t derived_key_challenge_mode;
     memcpy(rpid, ctap_buffer+4, 12); 
-    // Read the mode byte from EEPROM rather than trusting the RAM copy. That
-    // copy is unconditionally zeroed by wipetasks() and by every
-    // done_process_packets() call (the raw-HID pipeline: PIN unlock, status,
-    // OKCONNECT, SSH/GPG - a different dispatch path from this one) and is only
-    // reloaded there for slot codes > 200, which this FIDO2 path never sends. So
-    // it is essentially always stale here, and every bit tested below would read
-    // as 0 whatever the user actually configured - silently ignoring both the
-    // kill switch (bit 1) and the stored-key opt-in (bit 4).
-    // okeeprom_eeget_derived_key_challenge_mode() is a plain single-byte
-    // eeprom_read_byte() with no side effects. ok_extension.cpp used to do this
-    // reload for the same reason, in code this change removed.
-    okeeprom_eeget_derived_key_challenge_mode(&derived_key_challenge_mode);
-    // Normalize before testing any bit. A stored byte may predate the
-    // enum+flags layout, and okcore_derived_mode_normalize() is where the
-    // legacy readings are pinned down - notably that legacy value 2 meant
-    // "extension disabled" and must never be read as the enum's "no
-    // confirmation required". Doing the translation here rather than in a
-    // release note is the whole point: a key in a drawer does not read
-    // release notes.
-    uint8_t ok_mode = 0, ok_flags = 0;
-    okcore_derived_mode_normalize(derived_key_challenge_mode, &ok_mode, &ok_flags);
+    // Read the policy byte from EEPROM rather than trusting any RAM copy. The
+    // RAM copies of the mode bytes are unconditionally zeroed by wipetasks()
+    // and by every done_process_packets() call (the raw-HID pipeline: PIN
+    // unlock, status, OKCONNECT, SSH/GPG - a different dispatch path from this
+    // one), so anything cached is essentially always stale here and every bit
+    // tested below would read as 0 whatever the user actually configured -
+    // silently ignoring both the kill switch and the stored-key opt-in.
+    // okcore_webcrypt_policy() is a plain single-byte read with no side
+    // effects. ok_extension.cpp used to do its own reload for the same reason,
+    // in code this change removed.
+    //
+    // Field 31 (webcrypt policy) is a separate EEPROM byte from field 30 (web
+    // derive INPUT mode) on purpose: "may the browser do this at all" and "how
+    // does the user confirm it" are different questions, and packing them into
+    // one byte is what produced the enum-versus-bitfield collision in field 21.
+    uint8_t wc_policy = okcore_webcrypt_policy();
     #ifdef DEBUG
 	Serial.println("Ctap buffer:");
     byteprint(ctap_buffer, 12);
@@ -131,37 +126,29 @@ int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
     appid_match1 = memcmp (stored_apprpid, rpid, 12);
 	appid_match2 = memcmp (stored_appid, _appid, 32);
 	int appid_match3 = memcmp (stored_appid_oa, _appid, 32); //OnlyAgent origin (onlyagent.app)
-    if ((appid_match1 == 0 || appid_match2 == 0 || appid_match3 == 0) && !(ok_flags & OKMODE_FLAG_DISABLE_EXT)) {
-        // A trusted origin now gets DERIVED-KEY access only (return 1) unless the
-        // user has explicitly opted in to stored-key operations over FIDO2 with
-        // bit 4. Level 2 is what unlocks the OKDECRYPT/OKSIGN tunnel in
+    if ((appid_match1 == 0 || appid_match2 == 0 || appid_match3 == 0) &&
+        !(wc_policy & OKWC_DISABLE_EXT)) {
+        // A trusted origin gets DERIVED-KEY access only (return 1) unless the
+        // user has explicitly opted in to stored-key operations over FIDO2.
+        // Level 2 is what unlocks the OKDECRYPT/OKSIGN tunnel in
         // ok_extension.cpp, i.e. PGP and any other operation against a REAL
         // slot, with the slot number chosen by the web page.
         //
         // This used to return 2 unconditionally, so every trusted origin could
         // sign and decrypt with any slot on an unlocked key, and a user who
         // wanted derived keys in the browser but NOT their PGP keys had no way
-        // to say so - the only opt-outs were bit 1 (kills the extension
-        // outright, derive included) and bit 2 (a widening, not a narrowing).
-        // Derived keys are label-scoped and reproducible; a stored PGP key is
-        // neither, so they do not belong behind the same switch.
+        // to say so. Derived keys are label-scoped and reproducible; a stored
+        // PGP key is neither, so they do not belong behind the same switch.
         //
-        // Default (mode byte 0) is therefore: derive yes, PGP no.
-        //
-        // Field 21 layout (see okcore.h / okcore_derived_mode_normalize):
-        //   value & 0x0F   input mode: 0 challenge code, 1 button press,
-        //                  2 RESERVED (legacy "disable extension"), 3 none
-        //   0x10  bit 4    allow stored-key (PGP) use over FIDO2
-        //   0x20  bit 5    disable the FIDO2 extension entirely
-        //   0x40 0x80      reserved
-        return (ok_flags & OKMODE_FLAG_ALLOW_STORED_KEY_FIDO2) ? 2 : 1;
+        // Default (unwritten policy byte) is therefore: derive yes, PGP no.
+        return (wc_policy & OKWC_ALLOW_STORED_KEY) ? 2 : 1;
     }
-    // The bit 2 escape hatch is GONE. It let an origin that matches NONE of the
-    // three hardcoded appids above through at level 1 as long as the message was
-    // an OKCONNECT. The allowed origins are compiled into this function on
-    // purpose; a user-settable bypass of that list is not a setting anyone
-    // needs, and it is the one setting whose misuse hands an arbitrary web page
-    // a derivation oracle.
+    // The old bit 2 escape hatch is GONE. It let an origin that matches NONE of
+    // the three hardcoded appids above through at level 1 as long as the
+    // message was an OKCONNECT. The allowed origins are compiled into this
+    // function on purpose; a user-settable bypass of that list is not a setting
+    // anyone needs, and it is the one setting whose misuse hands an arbitrary
+    // web page a derivation oracle.
     else return 0;
 }
 
@@ -441,6 +428,36 @@ int ctap_user_presence_test(uint32_t wait)
         return 0;
     }
 
+}
+
+// 3-digit challenge on the CTAP path: the user must press the three given
+// buttons in order within `wait` ms. Returns 1 = entered, 0 = timeout,
+// -2 = wrong button, 2 = presence disabled, other >1 = handle_packets() result
+// (same contract as ctap_user_presence_test so callers map errors the same way).
+int ctap_challenge_test(uint32_t wait, uint8_t b1, uint8_t b2, uint8_t b3)
+{
+    extern int button_selected;
+    uint8_t expected[3] = {b1, b2, b3};
+    int idx = 0;
+    int ret = 0;
+    uint8_t blink = 0;
+    uint32_t t1 = millis();
+    if (_up_disabled) return 2;
+    fadeon(171);
+    while (1) {
+        if (t1 + wait < millis()) { fadeoff(1); return 0; }
+        if (touch_sense_loop()) {
+            uint8_t pressed = (uint8_t)(button_selected - '0');
+            button_selected = 0;
+            if (pressed != expected[idx]) { fadeoff(1); u2f_button = 0; return -2; }
+            if (++idx == 3) { fadeoff(0); u2f_button = 0; return 1; }
+        }
+        ret = handle_packets();
+        if (ret) return ret;
+        if (blink == 0) setcolor(171);
+        if (blink == 128) setcolor(0);
+        blink++;
+    }
 }
 
 int handle_packets()

@@ -138,6 +138,49 @@ extern uint8_t recv_buffer[64];
 extern uint8_t pending_operation;
 extern int packet_buffer_offset;
 extern uint8_t packet_buffer_details[5];
+
+// ---- Web derived key user input (web_derive_mode, OKSETSLOT 30) ----
+// The setting decides how the user authorises a shared-secret derive: 0 = the
+// 3-digit challenge code, 1 = button press (default), 2 = none. The key never
+// depends on it. A REQ_PRESS request variant can only RAISE the requirement to
+// a press (a page asking for presence gets it; a hostile page cannot lower the
+// setting). Challenge code = SHA-256 over the request bytes the device hashes -
+// the 32-byte label hash then the 32/64-byte ct_X / input public key - bytes
+// 0/15/31 mod 6 (mod 3 on a DUO) plus one; the web app computes and shows it.
+// Public-key derives are never gated.
+static int web_derive_gate(uint8_t floor_mode, const uint8_t *data, int len)
+{
+	extern uint8_t onlykeyhw;
+	uint8_t need = okcore_web_derive_mode();
+	// floor_mode is the weakest confirmation this CALL SITE will accept,
+	// independent of the user setting. It replaces the old REQ_PRESS opcode
+	// variants, which let the REQUEST raise the requirement: those opcodes are
+	// gone (one label, one key), and a per-request knob was the wrong shape
+	// anyway - whether a confirmation is required follows from what is being
+	// asked for, not from which opcode a page chose to send. The setting can
+	// still pick a STRONGER confirmation than the floor.
+	if (need == USER_INPUT_NONE && floor_mode != USER_INPUT_NONE) need = floor_mode;
+	if (need == USER_INPUT_NONE) return 0;
+	int but;
+	device_set_status(CTAPHID_STATUS_UPNEEDED);
+	if (need == USER_INPUT_PRESS) {
+		but = ctap_user_presence_test(CTAP2_UP_DELAY_MS);
+	} else {
+		uint8_t h[32];
+		SHA256_CTX c;
+		sha256_init(&c);
+		sha256_update(&c, (uint8_t *)data, len);
+		sha256_final(&c, h);
+		uint8_t m = (onlykeyhw == OK_HW_DUO) ? 3 : 6;
+		but = ctap_challenge_test(CTAP2_UP_DELAY_MS, (h[0] % m) + 1, (h[15] % m) + 1, (h[31] % m) + 1);
+		memset(h, 0, 32);
+	}
+	if (but == -2) { pending_operation = 0; return CTAP2_ERR_OPERATION_DENIED; }
+	if (but > 1) return CTAP2_ERR_PROCESSING;
+	if (but < 0) return CTAP2_ERR_KEEPALIVE_CANCEL;
+	if (but == 0) { pending_operation = 0; return CTAP2_ERR_ACTION_TIMEOUT; }
+	return 0;
+}
 uint8_t transit_key[32];
 
 // Duplicate-packet suppression high-water mark for inbound OKDECRYPT/OKSIGN
@@ -385,27 +428,18 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 						return ret;
 					}
 					else { 
-						// Generate Shared Secret. Both opcodes require a
-						// touch now - see the note above; there is no opt-out.
+						// Generate Shared Secret. The user's web-derive input
+						// mode (field 30) chooses BETWEEN a challenge code and a
+						// plain press - but not whether to confirm at all. A
+						// shared secret is a decryption capability, so
+						// USER_INPUT_PRESS is the floor here and "none" cannot
+						// reach this call. Public-key derivation is ungated: it
+						// is public data, and the caller cannot turn that into a
+						// secret.
 						{
-							int but;
-							device_set_status(CTAPHID_STATUS_UPNEEDED);
-							but = ctap_user_presence_test(CTAP2_UP_DELAY_MS);
-							if ( but > 1 )
-							{
-								return CTAP2_ERR_PROCESSING;
-							}
-							else if (but < 0)
-							{
-								return CTAP2_ERR_KEEPALIVE_CANCEL;
-							}
-							else if (but == 0)
-							{
-								pending_operation=0;
-								return CTAP2_ERR_ACTION_TIMEOUT;
-							} else if (os == 'W') {
-								packet_buffer_details[3] = 'W';
-							}
+							int g = web_derive_gate(USER_INPUT_PRESS, client_handle + 43, 32 + pubsize);
+							if (g) return g;
+							if (os == 'W') packet_buffer_details[3] = 'W';
 						}
 						// Use ecc_private_key and provided pubkey to generate shared secret
 						if (okcrypto_shared_secret (input_pubkey, temp+32+sizeof(UNLOCKED)+1+pubsize)) { // Generate derived key shared secret in temp
@@ -459,7 +493,8 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 				// so cannot use the single-shot OKCONNECT route. Anything
 				// naming a real slot is a stored-key operation (PGP and
 				// friends) and needs level 2, i.e. the user opting in with
-				// mode bit 4. Without this check, disabling PGP over FIDO2
+				// OKWC_ALLOW_STORED_KEY in field 31. Without this check,
+				// disabling PGP over FIDO2
 				// would also disable derived decapsulation, since both arrive
 				// as OKDECRYPT.
 				//

@@ -149,6 +149,9 @@ extern void okcrypto_hkdf_expand (const uint8_t *prk, const uint8_t *info, size_
 extern void okcrypto_xwing_derive_seed (const uint8_t *label32, uint8_t *seed_out);
 extern void okcrypto_xwing_derive_getpubkey (const uint8_t *label32, uint8_t *out);  /* XWING_PK_SIZE */
 extern int  okcrypto_xwing_derive_decaps (const uint8_t *label32, const uint8_t *ct, uint8_t *out);
+/* Drop any partially reassembled / awaiting-confirmation derived decaps
+ * request. Called from wipetasks() and on every framing error. */
+extern void okcrypto_derive_reset (void);
 
 
 #ifdef __cplusplus

@@ -284,69 +284,10 @@ uint8_t Challenge_button3 = 0;
 uint8_t CRYPTO_AUTH = 0;
 uint8_t derived_key_challenge_mode = 0;
 
-/* Field 21 (derived key mode) - normalize a stored byte into (mode, flags).
- *
- * The byte carries a user-input-mode enum in the low nibble and policy flags in
- * the high nibble. It ALSO has to survive bytes written by older firmware that
- * treated the whole thing as a flat bitfield, and that is the hard part: a
- * device in a drawer keeps whatever byte it was given, and a reinterpretation
- * that guesses wrong must never guess in the permissive direction.
- *
- * Legacy meanings, for reference:
- *   bit 0 (1)  button press instead of 3-digit challenge code
- *   bit 1 (2)  disable the FIDO2 extension entirely
- *   bit 2 (4)  allow OKCONNECT from untrusted origins   (feature removed)
- *   bit 3 (8)  allow touch-free browser derivation      (feature removed)
- *
- * Two rules keep every legacy byte safe without a migration pass, an EEPROM
- * write, or anyone reading a release note:
- *
- * 1. Enum value 2 is RESERVED and never assigned. "No confirmation" is 3.
- *    Legacy 2 means "extension disabled" - the most restrictive state the byte
- *    can express - and if 2 were reused for "no confirmation required" then
- *    every key configured that way would silently become the LEAST restrictive
- *    state on upgrade. That is the one direction a misread must never take, so
- *    the value stays reserved and is translated back to what it always meant.
- *
- * 2. Any low-nibble value that is not a defined mode falls back to 0, the
- *    3-digit challenge code, which is the most restrictive input mode. That
- *    covers legacy 4, 8, 9 and anything else a future or corrupted byte holds.
- *
- *    CORRECTION to an earlier version of this comment, which claimed legacy 8/9
- *    (touch-free derivation) were common because the shipped web app needed
- *    bit 3 for its password generator and vault. That was wrong, and wrong in
- *    the direction that overstates the case: password-generator.js is registered
- *    only in plugins-devel.js and never shipped, and vault.js - which does ship
- *    in plugins.js - requests touch-free derivation and is therefore REFUSED on
- *    a default key, so it has never worked. Nobody had a working reason to set
- *    bit 3, and the realistic legacy population of this byte is 0 and 1 only.
- *    The fallback stands on its own merits - unknown values must fail closed
- *    whether or not anyone ever wrote them - but it is not carrying the weight
- *    the old comment gave it.
- *
- * Bits 4 and 5 cannot appear in a legacy byte - legacy only ever used bits 0-3
- * - so a set bit there can only have come from firmware that meant it.
- */
-void okcore_derived_mode_normalize (uint8_t raw, uint8_t *mode, uint8_t *flags) {
-	uint8_t m = raw & OKMODE_INPUT_MASK;
-	uint8_t f = raw & OKMODE_FLAG_MASK;
-
-	if (m == OKMODE_INPUT_RESERVED_LEGACY_DISABLE) {
-		/* Legacy "disable the extension". Preserve the intent exactly. */
-		m = OKMODE_INPUT_CHALLENGE;
-		f |= OKMODE_FLAG_DISABLE_EXT;
-	} else if (m != OKMODE_INPUT_CHALLENGE &&
-	           m != OKMODE_INPUT_BUTTON &&
-	           m != OKMODE_INPUT_NONE) {
-		/* Unknown - legacy 4/8/9, or a byte from the future. Fail closed. */
-		m = OKMODE_INPUT_CHALLENGE;
-	}
-
-	if (mode)  *mode  = m;
-	if (flags) *flags = f;
-}
 
 uint8_t stored_key_challenge_mode = 0;
+uint8_t user_input_mode = USER_INPUT_CHALLENGE;
+uint8_t pending_op_no_press = 0;
 /*************************************/
 //RNG Assignments
 /*************************************/
@@ -2081,6 +2022,10 @@ void set_slot(uint8_t *buffer)
 			Serial.println(); //newline
 			Serial.println("Writing derived_key_challenge_mode to EEPROM...");
 			#endif
+			if (buffer[7] > USER_INPUT_NONE) { hidprint("Error invalid user input mode"); break; }
+			#ifndef OK_ALLOW_NO_PRESS
+			if (buffer[7] == USER_INPUT_NONE) { hidprint("Error unsupported user input mode"); break; }
+			#endif
 			okeeprom_eeset_derived_key_challenge_mode(buffer + 7);
 			hidprint("Successfully set derived key challenge mode");
 		}
@@ -2097,8 +2042,69 @@ void set_slot(uint8_t *buffer)
 			Serial.println(); //newline
 			Serial.println("Writing stored_key_challenge_mode to EEPROM...");
 			#endif
+			if (buffer[7] > USER_INPUT_NONE) { hidprint("Error invalid user input mode"); break; }
+			#ifndef OK_ALLOW_NO_PRESS
+			if (buffer[7] == USER_INPUT_NONE) { hidprint("Error unsupported user input mode"); break; }
+			#endif
 			okeeprom_eeset_stored_key_challenge_mode(buffer + 7);
 			hidprint("Successfully set stored key challenge mode");
+		}
+		else
+		{
+			hidprint("Error not in config mode");
+		}
+		break;
+	case 30:
+		// Web derived key user input mode (web app / OnlyAgent, over FIDO2 or
+		// raw HID slot 128): 0 = challenge code, 1 = button press (default),
+		// 2 = no press. The key itself never depends on this setting - press
+		// choice is authorisation only, so a file encrypted to a label always
+		// decrypts whatever this is set to.
+		//
+		// 2 does NOT reach a shared-secret derivation. Call sites pass a floor
+		// to web_derive_gate() / okcore_prime_user_confirmation(), and a shared
+		// secret - a decryption capability - floors at a press. What 2 actually
+		// buys is ungated PUBLIC-KEY derivation, which is public data. This is
+		// what makes field 30 safe to expose as a plain three-way setting.
+		if (configmode == true || !initcheck)
+		{
+			if (buffer[7] > USER_INPUT_NONE) { hidprint("Error invalid user input mode"); break; }
+			#ifdef DEBUG
+			Serial.println();
+			Serial.println("Writing web_derive_mode to EEPROM...");
+			#endif
+			okeeprom_eeset_web_derive_mode(buffer + 7);
+			hidprint("Successfully set web derived key mode");
+		}
+		else
+		{
+			hidprint("Error not in config mode");
+		}
+		break;
+	case 31:
+		// Webcrypt policy bitfield - what the browser may do over the FIDO2
+		// extension, as opposed to field 30's how-the-user-confirms-it:
+		//   bit 0 (OKWC_ALLOW_STORED_KEY)  stored-slot OKSIGN/OKDECRYPT (PGP)
+		//   bit 1 (OKWC_DISABLE_EXT)       turn the extension off entirely
+		// Both default off: derived keys yes, PGP no, extension on.
+		//
+		// Undefined bits are refused rather than masked away, so a host that
+		// means something this firmware does not understand gets an error
+		// instead of a silent partial write.
+		//
+		// The FIRST write here also ends the legacy inheritance in
+		// okcore_webcrypt_policy(): until this byte is written, the disable bit
+		// is read from legacy field 21 bit 1 so an extension the user had
+		// turned off stays off across the upgrade.
+		if (configmode == true || !initcheck)
+		{
+			if (buffer[7] & ~OKWC_VALID_MASK) { hidprint("Error invalid webcrypt policy"); break; }
+			#ifdef DEBUG
+			Serial.println();
+			Serial.println("Writing webcrypt_policy to EEPROM...");
+			#endif
+			okeeprom_eeset_webcrypt_policy(buffer + 7);
+			hidprint("Successfully set webcrypt policy");
 		}
 		else
 		{
@@ -5386,7 +5392,12 @@ void ecc_priv_flash(uint8_t *buffer, bool wipe, bool quiet)
 			// own `if (!CRYPTO_AUTH)` check can never be satisfied - CRYPTO_AUTH
 			// is otherwise only ever primed by the decaps functions, for their
 			// own unrelated operations.
-			if (!CRYPTO_AUTH) {
+			// Keys can only be loaded in config mode, and the device cannot be
+			// used while in config mode (leaving it means a physical
+			// remove/reinsert), so config mode IS the presence proof - and the
+			// button challenge cannot be completed there anyway (the config-mode
+			// LED owns the indicator). Only prime the challenge on first use.
+			if (!CRYPTO_AUTH && !configmode) {
 				uint8_t primebuf[64];
 				memset(primebuf, 0, 64);
 				primebuf[4] = buffer[4];
@@ -5397,7 +5408,7 @@ void ecc_priv_flash(uint8_t *buffer, bool wipe, bool quiet)
 				process_packets(primebuf, 0, 0);
 				pending_operation = CTAP2_ERR_USER_ACTION_PENDING;
 				return;
-			} else if (CRYPTO_AUTH != 4) {
+			} else if (CRYPTO_AUTH != 4 && !configmode) {
 				return; // challenge in progress, ignore re-entrant triggers
 			}
 			// CRYPTO_AUTH==4: confirmed via the 3-button challenge, proceed.
@@ -6054,6 +6065,145 @@ bool wipebuffersafter5sec(Task *me)
 	return false;
 }
 
+// Web derived keys (browser over FIDO2, python age plugin over raw HID slot
+// 128) follow web_derive_mode: 0 challenge code, 1 button press (default),
+// 2 no press. An unwritten EEPROM byte (0xFF) reads as the default. No-press
+// is honoured here when set (unlike stored/derived keys) - press-free per-site
+// derivation is an opt-in feature, not the default.
+/* Field 31 - webcrypt policy, with a one-way migration off the legacy field-21
+ * byte.
+ *
+ * Legacy field 21 was a bitfield before it became an input-mode enum:
+ *
+ *   bit 0 (1)  button press instead of a 3-digit challenge code
+ *   bit 1 (2)  disable the FIDO2 extension entirely
+ *   bit 2 (4)  allow OKCONNECT from untrusted origins   (feature removed)
+ *   bit 3 (8)  allow touch-free browser derivation      (feature removed)
+ *
+ * okcore_user_input_mode_for_slot() masks that byte with 0x03 to read the input
+ * mode out of it, which is right for the mode but DISCARDS bit 1. Bit 1 is the
+ * one legacy bit that expressed a restriction: a user who turned the extension
+ * off would have it silently turned back on by the upgrade. That is the one
+ * direction a migration must never take, and "it is in the release notes" is
+ * not a mitigation - a key in a drawer does not read release notes.
+ *
+ * So: while field 31 is unwritten (erased EEPROM reads 0xFF), the disable bit is
+ * inherited from legacy field 21 bit 1. The first explicit write of field 31
+ * ends the inheritance permanently - from then on the user's stated policy is
+ * the whole answer, including turning the extension back on.
+ *
+ * Only bit 1 is inherited. Bits 2 and 3 named features that no longer exist,
+ * and both were WIDENINGS; resurrecting a widening from a legacy byte is
+ * exactly backwards. Bit 0 is an input mode and belongs to field 21.
+ */
+uint8_t okcore_webcrypt_policy() {
+	uint8_t policy = OKWC_UNSET;
+	okeeprom_eeget_webcrypt_policy(&policy);
+	if (policy != OKWC_UNSET) return policy & OKWC_VALID_MASK;
+
+	uint8_t legacy = 0;
+	okeeprom_eeget_derived_key_challenge_mode(&legacy);
+	if (legacy == 0xFF) return 0;             /* blank key: defaults */
+	return (legacy & 0x02) ? OKWC_DISABLE_EXT : 0;
+}
+
+uint8_t okcore_web_derive_mode() {
+	uint8_t mode = USER_INPUT_PRESS;
+	okeeprom_eeget_web_derive_mode(&mode);
+	if (mode > USER_INPUT_NONE) mode = USER_INPUT_PRESS;
+	return mode;
+}
+
+uint8_t okcore_user_input_mode_for_slot(uint8_t slot) {
+	if (slot == RESERVED_KEY_WEB_DERIVATION) return okcore_web_derive_mode();
+	uint8_t raw = USER_INPUT_CHALLENGE;
+	uint8_t derived = (slot > 200);
+	if (derived) {
+		okeeprom_eeget_derived_key_challenge_mode(&raw);
+	} else {
+		okeeprom_eeget_stored_key_challenge_mode(&raw);
+	}
+	uint8_t mode = raw & 0x03; // older firmware packed FIDO2 origin bits into this byte
+
+	// THE VALUE-2 COLLISION. In the legacy FIELD 21 bitfield, bit 1 meant
+	// "disable the FIDO2 extension" - the most restrictive thing that byte could
+	// say. In the enum it means USER_INPUT_NONE - the least restrictive. A
+	// legacy byte of 0x02 read as an enum therefore turns "do not do this at
+	// all" into "do this without asking me", which is the one direction a
+	// migration must never take.
+	//
+	// The masking above hid this: with OK_ALLOW_NO_PRESS off, 2 fell closed to
+	// the challenge code and the collision was invisible. Turn that build flag
+	// on - which is the whole point of it, unattended agents - and every key
+	// carrying legacy 0x02 silently becomes press-free. Caught by an exhaustive
+	// sweep of all 256 legacy bytes under both build configurations; it was NOT
+	// caught by reading the code, because each half is locally reasonable.
+	//
+	// Field 31 is the marker for which meaning applies. It does not exist on any
+	// firmware that wrote the legacy bitfield, so while it is unwritten a 2 in
+	// field 21 can only be legacy and is refused as a mode. The first explicit
+	// field 31 write means the user has been through split-aware firmware, and
+	// from then on 2 is the enum's "none" like any other value.
+	//
+	// Field 22 never carried the bitfield - it was always an input mode - so it
+	// is not affected and is not gated on field 31.
+	if (derived && mode == USER_INPUT_NONE) {
+		uint8_t policy_raw = OKWC_UNSET;
+		okeeprom_eeget_webcrypt_policy(&policy_raw);
+		if (policy_raw == OKWC_UNSET) mode = USER_INPUT_CHALLENGE;
+	}
+
+	#ifndef OK_ALLOW_NO_PRESS
+	if (mode == USER_INPUT_NONE) mode = USER_INPUT_CHALLENGE; // fail closed
+	#endif
+	if (mode > USER_INPUT_NONE) mode = USER_INPUT_CHALLENGE;
+	return mode;
+}
+
+// Run the operation that done_process_packets() staged (encrypted in
+// large_buffer, described by packet_buffer_details) once the user has
+// confirmed it - or immediately, for USER_INPUT_NONE. Called from the button
+// handler in OnlyKey.ino and from checkKey() for the no-press path; CRYPTO_AUTH
+// must already be 4.
+void okcore_run_pending_op() {
+	derived_key_challenge_mode = 0;
+	stored_key_challenge_mode = 0;
+	if (packet_buffer_details[0] == OKSIGN) {
+		recv_buffer[4] = packet_buffer_details[0];
+		recv_buffer[5] = packet_buffer_details[1];
+		okcrypto_sign(recv_buffer);
+	} else if (packet_buffer_details[0] == OKDECRYPT) {
+		recv_buffer[4] = packet_buffer_details[0];
+		recv_buffer[5] = packet_buffer_details[1];
+		okcrypto_decrypt(recv_buffer);
+	} else if (packet_buffer_details[0] == OKHMAC) {
+		okcrypto_hmacsha1();
+	} else if (packet_buffer_details[0] == OKWEBAUTHN) {
+		u2f_button = 1;
+		unsigned long u2fwait = millis() + 4000;
+		while (u2f_button && millis() < u2fwait) {
+			recvmsg(0);
+		}
+		u2f_button = 0;
+	} else if (packet_buffer_details[0] == OKSETPRIV) {
+		// PQC (X-Wing/ML-KEM) keygen confirmation: ecc_priv_flash() primed this
+		// via process_packets(), which encrypted the [keytype, 0xFF x8] trigger
+		// into large_buffer - decrypt it back, rebuild recv_buffer in the layout
+		// set_private()/ecc_priv_flash() expect, and re-run now that CRYPTO_AUTH==4.
+		okcore_aes_gcm_decrypt(large_buffer, packet_buffer_details[0], packet_buffer_details[1], profilekey, large_buffer_offset);
+		recv_buffer[4] = packet_buffer_details[0];
+		recv_buffer[5] = packet_buffer_details[1];
+		recv_buffer[6] = large_buffer[0];
+		memcpy(recv_buffer + 7, large_buffer + 1, large_buffer_offset - 1);
+		set_private(recv_buffer);
+	}
+	CRYPTO_AUTH = 0;
+	user_input_mode = USER_INPUT_CHALLENGE;
+	pending_op_no_press = 0;
+	packet_buffer_details[0] = 0;
+	fadeoff(0);
+}
+
 void wipetasks() {
 	packet_buffer_offset = 0;
 	memset(ctap_buffer, 0, CTAPHID_BUFFER_SIZE);
@@ -6087,7 +6237,12 @@ void wipetasks() {
 	Challenge_button3 = 0;
 	derived_key_challenge_mode = 0;
 	stored_key_challenge_mode = 0;
+	user_input_mode = USER_INPUT_CHALLENGE;
+	pending_op_no_press = 0;
 	pending_operation = 0;
+	// A derived X-Wing decaps request that was mid-reassembly, or staged and
+	// waiting for a confirmation that never came, dies with everything else.
+	okcrypto_derive_reset();
 	if (isfade || CRYPTO_AUTH) {
 		fadeoff(1); //Fade Red, failed to complete within 5 seconds
 	}
@@ -6722,6 +6877,15 @@ void backup()
 		large_temp[large_buffer_offset] = 0xFF;   //delimiter
 		large_temp[large_buffer_offset + 1] = 0;  //slot 0
 		large_temp[large_buffer_offset + 2] = 21; //21 - derived challenge mode
+		large_temp[large_buffer_offset + 3] = temp[0];
+		large_buffer_offset = large_buffer_offset + 4;
+	}
+	okeeprom_eeget_web_derive_mode(ptr);
+	if (*ptr != 0)
+	{
+		large_temp[large_buffer_offset] = 0xFF;   //delimiter
+		large_temp[large_buffer_offset + 1] = 0;  //slot 0
+		large_temp[large_buffer_offset + 2] = 30; //30 - web derived key mode
 		large_temp[large_buffer_offset + 3] = temp[0];
 		large_buffer_offset = large_buffer_offset + 4;
 	}
@@ -7611,44 +7775,70 @@ void done_process_single () {
 
 */
 
-void done_process_packets()
-{
+/* Prime the user-confirmation state for an operation that is fully staged and
+ * waiting. Factored out of done_process_packets() so the derived X-Wing decaps
+ * path in okcrypto_decrypt(), which does its own reassembly and never fills
+ * packet_buffer, shows the user the SAME challenge code for the same request -
+ * previously that path had no confirmation at all.
+ *
+ * msg/msg_len is whatever the challenge code should be bound to. The three
+ * digits are bytes 0, 15 and 31 of SHA-256 over it, so the caller may pass the
+ * request itself or a hash of it; passing a hash of a hash changes the digits
+ * but keeps the binding, which is why both callers are explicit about what
+ * they cover. */
+void okcore_prime_user_confirmation (uint8_t opcode, uint8_t slot,
+                                     const uint8_t *msg, size_t msg_len) {
 	uint8_t temp[32];
-	SoftTimer.remove(&Wipedata); //Cancel this we got all packets
+	SoftTimer.remove(&Wipedata);
 	SoftTimer.remove(&Endfade);
-	#ifdef DEBUG
-	Serial.println("done_process_packets");
-	#endif
 	isfade = 1;
 	derived_key_challenge_mode = 0;
 	stored_key_challenge_mode = 0;
 	CRYPTO_AUTH = 1;
+	packet_buffer_details[0] = opcode;
+	packet_buffer_details[1] = slot;
 	fadeoffafter20(); //Wipe and fadeoff after 20 seconds
-	if (packet_buffer_details[1] > 200) { 
-		okeeprom_eeget_derived_key_challenge_mode(&derived_key_challenge_mode);
-	}
-	if (packet_buffer_details[1] < 5 || (packet_buffer_details[1] > 100 && packet_buffer_details[1] <= 116)) { 
-		okeeprom_eeget_stored_key_challenge_mode(&stored_key_challenge_mode);
-	}
+	// One setting per key family, resolved by slot: derived keys (SSH/GPG
+	// derivation codes >200 and the web/age derivation slot 128) follow
+	// derived_key_challenge_mode, everything else (RSA 1-4, ECC 101-132)
+	// follows stored_key_challenge_mode. The two used to be OR-ed together,
+	// so press-only on either made both press-only.
+	user_input_mode = okcore_user_input_mode_for_slot(slot);
 	#ifdef STD_VERSION
-	if ((is_bit_set(derived_key_challenge_mode, 0))  || stored_key_challenge_mode) {
+	if (user_input_mode == USER_INPUT_NONE) {
+		// Run the operation from the main task after this receive completes,
+		// exactly as the button handler would, with no user interaction.
+		CRYPTO_AUTH = 4;
+		pending_op_no_press = 1;
+	} else if (user_input_mode == USER_INPUT_PRESS) {
 		CRYPTO_AUTH = 3;
 	} else {
 		SHA256_CTX msg_hash;
 		sha256_init(&msg_hash);
-		sha256_update(&msg_hash, packet_buffer, packet_buffer_offset); //add data to sign
-		sha256_final(&msg_hash, temp);					//Temporarily store hash
-        if (onlykeyhw==OK_HW_DUO) {
-            Challenge_button1 = (temp[0] % 3) + '0' + 1;	//Get value 1-6 for challenge 1
-            Challenge_button2 = (temp[15] % 3) + '0' + 1;	//Get value 1-6 for challenge 2
-            Challenge_button3 = (temp[31] % 3) + '0' + 1;	//Get value 1-6 for challenge 3	
-        } else {
-            Challenge_button1 = (temp[0] % 6) + '0' + 1;	//Get value 1-6 for challenge 1
-            Challenge_button2 = (temp[15] % 6) + '0' + 1;	//Get value 1-6 for challenge 2
-            Challenge_button3 = (temp[31] % 6) + '0' + 1;	//Get value 1-6 for challenge 3	
-        }
+		sha256_update(&msg_hash, msg, msg_len);
+		sha256_final(&msg_hash, temp);
+		if (onlykeyhw==OK_HW_DUO) {
+			Challenge_button1 = (temp[0] % 3) + '0' + 1;
+			Challenge_button2 = (temp[15] % 3) + '0' + 1;
+			Challenge_button3 = (temp[31] % 3) + '0' + 1;
+		} else {
+			Challenge_button1 = (temp[0] % 6) + '0' + 1;
+			Challenge_button2 = (temp[15] % 6) + '0' + 1;
+			Challenge_button3 = (temp[31] % 6) + '0' + 1;
+		}
 	}
 	#endif
+	memset(temp, 0, sizeof(temp));
+}
+
+void done_process_packets()
+{
+	#ifdef DEBUG
+	Serial.println("done_process_packets");
+	#endif
+	// The challenge code covers the staged request itself.
+	okcore_prime_user_confirmation(packet_buffer_details[0], packet_buffer_details[1],
+	                               packet_buffer, packet_buffer_offset);
 	#ifdef DEBUG
 	Serial.println("Received Message");
 	byteprint(packet_buffer, packet_buffer_offset);

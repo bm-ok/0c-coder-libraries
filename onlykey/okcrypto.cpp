@@ -444,6 +444,26 @@ void okcrypto_getpubkey (uint8_t *buffer) {
 	}
 }
 
+/* Reassembly state for the derived X-Wing decapsulation request that arrives
+ * over OKDECRYPT in multiple HID reports. File scope, not function statics,
+ * because the request is reassembled across one call sequence, held across the
+ * user-confirmation wait, and consumed by a later re-entry from
+ * okcore_run_pending_op() - and because wipetasks() has to be able to drop it.
+ *
+ * derive_pending distinguishes "confirmed a request we actually staged" from a
+ * re-entry with CRYPTO_AUTH == 4 left over from some other operation; without
+ * it, a stale large_buffer would be decapsulated as if it were a request. */
+static uint8_t derive_label[32];
+static int     derive_offset  = 0;
+static uint8_t derive_pending = 0;
+
+void okcrypto_derive_reset (void) {
+	derive_offset  = 0;
+	derive_pending = 0;
+	memset(derive_label, 0, sizeof(derive_label));
+	memset(large_buffer, 0, LARGE_BUFFER_SIZE);
+}
+
 void okcrypto_decrypt (uint8_t *buffer){
 	uECC_set_rng(&RNG2);
 	uint8_t features = 0;
@@ -495,8 +515,54 @@ void okcrypto_decrypt (uint8_t *buffer){
 		// ciphertext into large_buffer (LARGE_BUFFER_SIZE == XWING_CT_SIZE ==
 		// 1120, an exact fit), so no buffer constant changes and the added RAM
 		// cost is 32 bytes.
-		static uint8_t derive_label[32];
-		static int derive_offset = 0;
+		//
+		// USER PRESENCE: this path used to answer the moment the last chunk
+		// landed, with no button gate at all - the FIDO2 route in
+		// ok_extension.cpp had its own, raw HID had none. It now goes through
+		// the same confirmation machinery as every other decrypt: the final
+		// chunk primes the challenge (okcore_prime_user_confirmation) and
+		// returns, and okcore_run_pending_op() re-enters here with
+		// CRYPTO_AUTH == 4 once the user has confirmed. The reassembled
+		// request is what the challenge code is computed over, so the code
+		// shown on the device is bound to the exact label and ciphertext being
+		// decapsulated - and matches what the FIDO2 path shows for the same
+		// request.
+		//
+		// The staged request is NOT encrypted into large_buffer the way
+		// done_process_packets() encrypts packet_buffer, because neither half
+		// of it is secret: ct is the sender's public ciphertext and the label
+		// tag is public derivation input. What matters is that they cannot be
+		// swapped between priming and confirmation, which the challenge hash
+		// covers.
+		if (CRYPTO_AUTH == 4) {
+			// Confirmed. derive_label/large_buffer still hold the request.
+			if (derive_pending != 1) {
+				hidprint("Error no derived decaps request pending");
+				fadeoff(0);
+				return;
+			}
+			derive_pending = 0;
+			uint8_t ss[XWING_SS_SIZE];
+			if (okcrypto_xwing_derive_decaps(derive_label, large_buffer, ss) != 0) {
+				hidprint("Error X-Wing derived decaps failed");
+				fadeoff(0);
+			} else {
+				send_transport_response(ss, XWING_SS_SIZE, true, true);
+			}
+			memset(ss, 0, sizeof(ss));
+			memset(derive_label, 0, sizeof(derive_label));
+			memset(large_buffer, 0, LARGE_BUFFER_SIZE);
+			// Release the LED/button state primed by the OKDECRYPT dispatcher's
+			// fadeon(128); without this isfade stayed set, the LED faded
+			// turquoise forever and every button press (config mode included)
+			// was ignored until the key was re-plugged. Seen on hardware
+			// 2026-09-03.
+			fadeoff(85);
+			return;
+		} else if (CRYPTO_AUTH) {
+			return; // confirmation in progress, ignore stray traffic
+		}
+
 		const int derive_total = 32 + XWING_CT_SIZE;
 		int n = (buffer[6] == 0xFF) ? 57 : buffer[6];
 
@@ -504,9 +570,7 @@ void okcrypto_decrypt (uint8_t *buffer){
 			// Overlong or desynchronised: drop the whole request rather than
 			// decapsulate against a half-filled buffer. Silent truncation here
 			// is exactly what TC-17 looked like from the host side.
-			derive_offset = 0;
-			memset(derive_label, 0, sizeof(derive_label));
-			memset(large_buffer, 0, LARGE_BUFFER_SIZE);
+			okcrypto_derive_reset();
 			hidprint("Error derived decaps payload size");
 			fadeoff(0);
 			return;
@@ -520,25 +584,29 @@ void okcrypto_decrypt (uint8_t *buffer){
 		if (buffer[6] == 0xFF) return;            /* more chunks coming */
 
 		if (derive_offset != derive_total) {
-			derive_offset = 0;
-			memset(derive_label, 0, sizeof(derive_label));
-			memset(large_buffer, 0, LARGE_BUFFER_SIZE);
+			okcrypto_derive_reset();
 			hidprint("Error derived decaps payload size");
 			fadeoff(0);
 			return;
 		}
 		derive_offset = 0;
+		derive_pending = 1;
 
-		uint8_t ss[XWING_SS_SIZE];
-		if (okcrypto_xwing_derive_decaps(derive_label, large_buffer, ss) != 0) {
-			hidprint("Error X-Wing derived decaps failed");
-			fadeoff(0);
-		} else {
-			send_transport_response(ss, XWING_SS_SIZE, true, true);
+		// Prime the confirmation over the whole reassembled request. Two
+		// updates rather than one concatenated buffer: there is no 1152-byte
+		// scratch space to build it in, and the hash is the same either way.
+		{
+			SHA256_CTX ch;
+			uint8_t chmsg[32];
+			sha256_init(&ch);
+			sha256_update(&ch, derive_label, 32);
+			sha256_update(&ch, large_buffer, XWING_CT_SIZE);
+			sha256_final(&ch, chmsg);
+			okcore_prime_user_confirmation(OKDECRYPT, RESERVED_KEY_WEB_DERIVATION,
+			                               chmsg, sizeof(chmsg));
+			memset(chmsg, 0, sizeof(chmsg));
 		}
-		memset(ss, 0, sizeof(ss));
-		memset(derive_label, 0, sizeof(derive_label));
-		memset(large_buffer, 0, LARGE_BUFFER_SIZE);
+		pending_operation = OKDECRYPT_ERR_USER_ACTION_PENDING;
 		return;
 	}
 	if (buffer[5] < 101) { //Slot 101-132 are for ECC, 1-4 are for RSA
@@ -2056,7 +2124,7 @@ void okcrypto_mlkem_keygen (uint8_t *buffer) {
 	Serial.println();
 	Serial.println("MLKEM KEYGEN MESSAGE RECEIVED");
 	#endif
-	if (!CRYPTO_AUTH) {
+	if (!CRYPTO_AUTH && !configmode) {
 		pending_operation=CTAP2_ERR_USER_ACTION_PENDING;
 		return;
 	}
@@ -2200,7 +2268,7 @@ void okcrypto_xwing_keygen (uint8_t *buffer) {
 	Serial.println();
 	Serial.println("XWING KEYGEN MESSAGE RECEIVED");
 	#endif
-	if (!CRYPTO_AUTH) {
+	if (!CRYPTO_AUTH && !configmode) {
 		pending_operation=CTAP2_ERR_USER_ACTION_PENDING;
 		return;
 	}

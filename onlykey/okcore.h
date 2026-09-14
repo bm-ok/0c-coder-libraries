@@ -216,18 +216,12 @@ extern "C"
 #define RESERVED_KEY_HMACSHA1_2 129
 #define RESERVED_KEY_WEB_DERIVATION 128
 
-/* Field 21 (derived key mode): user-input-mode enum in the low nibble, policy
- * flags in the high nibble. See okcore_derived_mode_normalize() in okcore.cpp
- * for why 2 is reserved and why unknown values fail closed. */
-#define OKMODE_INPUT_MASK                       0x0F
-#define OKMODE_FLAG_MASK                        0xF0
-#define OKMODE_INPUT_CHALLENGE                  0    /* 3-digit challenge code */
-#define OKMODE_INPUT_BUTTON                     1    /* any button press */
-#define OKMODE_INPUT_RESERVED_LEGACY_DISABLE    2    /* never assign: legacy "disable extension" */
-#define OKMODE_INPUT_NONE                       3    /* no confirmation */
-#define OKMODE_FLAG_ALLOW_STORED_KEY_FIDO2      0x10 /* bit 4: PGP over FIDO2 */
-#define OKMODE_FLAG_DISABLE_EXT                 0x20 /* bit 5: no FIDO2 extension at all */
-extern void okcore_derived_mode_normalize (uint8_t raw, uint8_t *mode, uint8_t *flags);
+/* Field 21 used to be a bitfield, then briefly an enum with policy flags packed
+ * into the high nibble. It is now a plain input-mode enum (USER_INPUT_*, see
+ * below) and nothing else; the policy bits live in their own byte, field 31
+ * (OKWC_*). okcore_user_input_mode_for_slot() reads the mode out of the legacy
+ * byte and okcore_webcrypt_policy() inherits the one legacy bit that expressed a
+ * restriction. */
 #define KEYTYPE_NACL 1
 #define KEYTYPE_ED25519 1
 #define KEYTYPE_P256R1 2
@@ -311,6 +305,37 @@ extern bool configmode;
 extern bool PDmode;
 extern int pin_set;
 extern int u2f_button;
+// User input modes. One enum for all three settings (OKSETSLOT 21 derived keys,
+// 22 stored keys, 30 web/FIDO2 derived keys): 0 = 3-digit challenge code,
+// 1 = any button press, 2 = none. For 21/22, 2 is only honoured in
+// OK_ALLOW_NO_PRESS builds (unattended agents); for 30 it is the default and
+// means the web app chooses per request via the REQ_PRESS variants.
+// user_input_mode is the mode resolved for the operation currently waiting.
+#define USER_INPUT_CHALLENGE 0
+#define USER_INPUT_PRESS 1
+#define USER_INPUT_NONE 2
+extern uint8_t user_input_mode;
+extern uint8_t pending_op_no_press;
+extern void okcore_run_pending_op();
+extern uint8_t okcore_user_input_mode_for_slot(uint8_t slot);
+extern uint8_t okcore_web_derive_mode();
+
+/* Field 31 - webcrypt policy. What the browser is ALLOWED to do over the FIDO2
+ * extension, as opposed to field 30's input mode (how the user confirms it).
+ *
+ * Both bits default OFF, which means: derived keys yes, stored keys (PGP) no,
+ * extension enabled. */
+#define OKWC_ALLOW_STORED_KEY  0x01  /* stored-slot OKSIGN/OKDECRYPT over FIDO2 */
+#define OKWC_DISABLE_EXT       0x02  /* no OnlyKey FIDO2 extension at all */
+#define OKWC_VALID_MASK        (OKWC_ALLOW_STORED_KEY | OKWC_DISABLE_EXT)
+#define OKWC_UNSET             0xFF  /* erased EEPROM: never configured */
+extern uint8_t okcore_webcrypt_policy();
+/* Stage the user-confirmation state (LED, challenge digits or press mode) for
+ * an operation that is already fully staged elsewhere. done_process_packets()
+ * passes the request it accumulated in packet_buffer; the derived X-Wing
+ * decaps path passes a hash over its own reassembled label||ciphertext. */
+extern void okcore_prime_user_confirmation (uint8_t opcode, uint8_t slot,
+                                            const uint8_t *msg, size_t msg_len);
 extern int large_buffer_offset;
 
 extern void okcore_flashset_2ndpinhashpublic (uint8_t *ptr);

@@ -311,11 +311,18 @@ uint8_t derived_key_challenge_mode = 0;
  * 2. Any low-nibble value that is not a defined mode falls back to 0, the
  *    3-digit challenge code, which is the most restrictive input mode. That
  *    covers legacy 4, 8, 9 and anything else a future or corrupted byte holds.
- *    Note legacy 8/9 (touch-free derivation) were common: the shipped web app
- *    needed bit 3 set for its password generator and vault, so real keys carry
- *    those values. They now land on challenge-code input with touch-free
- *    derivation gone, which is the safe reading of a setting that no longer
- *    exists.
+ *
+ *    CORRECTION to an earlier version of this comment, which claimed legacy 8/9
+ *    (touch-free derivation) were common because the shipped web app needed
+ *    bit 3 for its password generator and vault. That was wrong, and wrong in
+ *    the direction that overstates the case: password-generator.js is registered
+ *    only in plugins-devel.js and never shipped, and vault.js - which does ship
+ *    in plugins.js - requests touch-free derivation and is therefore REFUSED on
+ *    a default key, so it has never worked. Nobody had a working reason to set
+ *    bit 3, and the realistic legacy population of this byte is 0 and 1 only.
+ *    The fallback stands on its own merits - unknown values must fail closed
+ *    whether or not anyone ever wrote them - but it is not carrying the weight
+ *    the old comment gave it.
  *
  * Bits 4 and 5 cannot appear in a legacy byte - legacy only ever used bits 0-3
  * - so a set bit there can only have come from firmware that meant it.

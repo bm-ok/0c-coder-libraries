@@ -168,12 +168,12 @@ void okeeprom_eeset_stored_key_challenge_mode (uint8_t *ptr) {
 }
 /*********************************/
 /*********************************/
-int okeeprom_eeget_web_derive_mode (uint8_t *ptr) {
-    okeeprom_eeget_common(ptr, EEpos_web_derive_mode, EElen_web_derive_mode);
-    return EElen_web_derive_mode;
+int okeeprom_eeget_web_agent_derive_mode (uint8_t *ptr) {
+    okeeprom_eeget_common(ptr, EEpos_web_agent_derive_mode, EElen_web_agent_derive_mode);
+    return EElen_web_agent_derive_mode;
 }
-void okeeprom_eeset_web_derive_mode (uint8_t *ptr) {
-    okeeprom_eeset_common(ptr, EEpos_web_derive_mode, EElen_web_derive_mode);
+void okeeprom_eeset_web_agent_derive_mode (uint8_t *ptr) {
+    okeeprom_eeset_common(ptr, EEpos_web_agent_derive_mode, EElen_web_agent_derive_mode);
 }
 /*********************************/
 int okeeprom_eeget_webcrypt_policy (uint8_t *ptr) {

@@ -2055,7 +2055,7 @@ void set_slot(uint8_t *buffer)
 		}
 		break;
 	case 30:
-		// User input mode for the web-derivation slot (128), on BOTH transports:
+		// User input mode for the web-and-agent derivation slot (128), on BOTH transports:
 		// the FIDO2 DERIVE_* extension and raw HID. okcore_user_input_mode_for_slot()
 		// routes slot 128 straight here, so a local agent over USB is governed by
 		// this byte exactly as the web app is - which is the point, since the
@@ -2065,7 +2065,7 @@ void set_slot(uint8_t *buffer)
 		// decrypts whatever this is set to.
 		//
 		// 2 means what it says, including for a shared secret: an unattended
-		// agent using an SSH key from the web-derivation slot has to be able to
+		// agent using an SSH key from that slot has to be able to
 		// run without a prompt, and that is what this setting is for. With it
 		// set, any request from a trusted origin derives and decapsulates
 		// silently while the key is unlocked - which is why it is off by
@@ -2078,10 +2078,10 @@ void set_slot(uint8_t *buffer)
 			if (buffer[7] > USER_INPUT_NONE) { hidprint("Error invalid user input mode"); break; }
 			#ifdef DEBUG
 			Serial.println();
-			Serial.println("Writing web_derive_mode to EEPROM...");
+			Serial.println("Writing web_agent_derive_mode to EEPROM...");
 			#endif
-			okeeprom_eeset_web_derive_mode(buffer + 7);
-			hidprint("Successfully set web derived key mode");
+			okeeprom_eeset_web_agent_derive_mode(buffer + 7);
+			hidprint("Successfully set web and agent derived key mode");
 		}
 		else
 		{
@@ -3482,9 +3482,9 @@ void okcore_flashset_pinhashpublic(uint8_t *ptr)
 		recv_buffer[6] = 0x61;
 		RNG2(recv_buffer + 7, 32);
 		set_private(recv_buffer); //set RESERVED_KEY_DERIVATION slot 132
-		recv_buffer[5] = RESERVED_KEY_WEB_DERIVATION;
+		recv_buffer[5] = RESERVED_KEY_WEB_AGENT_DERIVATION;
 		RNG2(recv_buffer + 7, 32);
-		set_private(recv_buffer); //set RESERVED_KEY_WEB_DERIVATION slot 128
+		set_private(recv_buffer); //set RESERVED_KEY_WEB_AGENT_DERIVATION slot 128
 		memset(recv_buffer, 0, sizeof(recv_buffer));
 	}
 	okcore_flashget_common(ptr, (unsigned long *)adr, EElen_pinhash);
@@ -3631,9 +3631,9 @@ void okcore_flashset_2ndpinhashpublic(uint8_t *ptr)
 		recv_buffer[6] = 0x61;
 		RNG2(recv_buffer + 7, 32);
 		set_private(recv_buffer); //set RESERVED_KEY_DERIVATION slot 132
-		recv_buffer[5] = RESERVED_KEY_WEB_DERIVATION;
+		recv_buffer[5] = RESERVED_KEY_WEB_AGENT_DERIVATION;
 		RNG2(recv_buffer + 7, 32);
-		set_private(recv_buffer); //set RESERVED_KEY_WEB_DERIVATION slot 128
+		set_private(recv_buffer); //set RESERVED_KEY_WEB_AGENT_DERIVATION slot 128
 		memset(recv_buffer, 0, sizeof(recv_buffer));
 	#endif
 	}
@@ -5362,7 +5362,7 @@ void ecc_priv_flash(uint8_t *buffer, bool wipe, bool quiet)
 	adr = adr + 14336; //8th free flash sector
 	//Write ID to EEPROM
 
-	if (buffer[5] < 101 || buffer[5] > 132 || ((buffer[5] == RESERVED_KEY_DERIVATION || buffer[5] == RESERVED_KEY_WEB_DERIVATION) && configmode == false && initcheck))
+	if (buffer[5] < 101 || buffer[5] > 132 || ((buffer[5] == RESERVED_KEY_DERIVATION || buffer[5] == RESERVED_KEY_WEB_AGENT_DERIVATION) && configmode == false && initcheck))
 	{
 #ifdef DEBUG
 		Serial.println("Error invalid ECC slot");
@@ -6072,8 +6072,9 @@ bool wipebuffersafter5sec(Task *me)
 	return false;
 }
 
-// Web derived keys (browser over FIDO2, python age plugin over raw HID slot
-// 128) follow web_derive_mode: 0 challenge code, 1 button press (default),
+// Web and agent derived keys (the web app over FIDO2, local agents and the
+// python age plugin over raw HID slot
+// 128) follow web_agent_derive_mode: 0 challenge code, 1 button press (default),
 // 2 no press. An unwritten EEPROM byte (0xFF) reads as the default. No-press
 // is honoured here when set (unlike stored/derived keys) - press-free per-site
 // derivation is an opt-in feature, not the default.
@@ -6114,15 +6115,15 @@ uint8_t okcore_webcrypt_policy() {
 	return (legacy & 0x02) ? OKWC_DISABLE_EXT : 0;
 }
 
-uint8_t okcore_web_derive_mode() {
+uint8_t okcore_web_agent_derive_mode() {
 	uint8_t mode = USER_INPUT_PRESS;
-	okeeprom_eeget_web_derive_mode(&mode);
+	okeeprom_eeget_web_agent_derive_mode(&mode);
 	if (mode > USER_INPUT_NONE) mode = USER_INPUT_PRESS;
 	return mode;
 }
 
 uint8_t okcore_user_input_mode_for_slot(uint8_t slot) {
-	if (slot == RESERVED_KEY_WEB_DERIVATION) return okcore_web_derive_mode();
+	if (slot == RESERVED_KEY_WEB_AGENT_DERIVATION) return okcore_web_agent_derive_mode();
 	uint8_t raw = USER_INPUT_CHALLENGE;
 	uint8_t derived = (slot > 200);
 	if (derived) {
@@ -6887,12 +6888,12 @@ void backup()
 		large_temp[large_buffer_offset + 3] = temp[0];
 		large_buffer_offset = large_buffer_offset + 4;
 	}
-	okeeprom_eeget_web_derive_mode(ptr);
+	okeeprom_eeget_web_agent_derive_mode(ptr);
 	if (*ptr != 0)
 	{
 		large_temp[large_buffer_offset] = 0xFF;   //delimiter
 		large_temp[large_buffer_offset + 1] = 0;  //slot 0
-		large_temp[large_buffer_offset + 2] = 30; //30 - web derived key mode
+		large_temp[large_buffer_offset + 2] = 30; //30 - web and agent derived key mode
 		large_temp[large_buffer_offset + 3] = temp[0];
 		large_buffer_offset = large_buffer_offset + 4;
 	}
@@ -8287,14 +8288,14 @@ void ByteToChar2(uint8_t *bytes, char *chars, unsigned int count, unsigned int i
 void fw_version_changes() {
 	uint8_t keytype;
 	// todo get key from 128, if empty write key
-	okeeprom_eeget_ecckey(&keytype, RESERVED_KEY_WEB_DERIVATION); 
-	if (keytype!=0x61) { // Empty no Web Derivation Key, added in fw 2.1.0
+	okeeprom_eeget_ecckey(&keytype, RESERVED_KEY_WEB_AGENT_DERIVATION); 
+	if (keytype!=0x61) { // Empty no Web/Agent Derivation Key, added in fw 2.1.0
 		outputmode = DISCARD;
 		recv_buffer[4] = OKSETPRIV;
-		recv_buffer[5] = RESERVED_KEY_WEB_DERIVATION;
+		recv_buffer[5] = RESERVED_KEY_WEB_AGENT_DERIVATION;
 		recv_buffer[6] = 0x61;
 		RNG2(recv_buffer + 7, 32);
-		set_private(recv_buffer); //set RESERVED_KEY_WEB_DERIVATION slot 128
+		set_private(recv_buffer); //set RESERVED_KEY_WEB_AGENT_DERIVATION slot 128
 		memset(recv_buffer, 0, sizeof(recv_buffer));
 		// Also wipe FIDO2 resident keys as these are now stored in new location
 		ctap_flash(NULL, NULL, NULL, 5);

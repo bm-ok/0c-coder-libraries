@@ -87,7 +87,7 @@
 #include "extensions.h"
 #include "ok_extension.h"
 
-// Functions for use with derived key (RESERVED_KEY_WEB_DERIVATION)
+// Functions for use with derived key (RESERVED_KEY_WEB_AGENT_DERIVATION)
 #define DERIVE_PUBLIC_KEY 1
 #define DERIVE_SHAREDSEC 2
 // 3 and 4 were DERIVE_PUBLIC_KEY_REQ_PRESS / DERIVE_SHAREDSEC_REQ_PRESS.
@@ -139,7 +139,7 @@ extern uint8_t pending_operation;
 extern int packet_buffer_offset;
 extern uint8_t packet_buffer_details[5];
 
-// ---- Web derived key user input (web_derive_mode, OKSETSLOT 30) ----
+// ---- Web and agent derived key user input (web_agent_derive_mode, OKSETSLOT 30) ----
 // The setting decides how the user authorises a shared-secret derive: 0 = the
 // 3-digit challenge code, 1 = button press (default), 2 = none. The key never
 // depends on it. A REQ_PRESS request variant can only RAISE the requirement to
@@ -148,10 +148,10 @@ extern uint8_t packet_buffer_details[5];
 // the 32-byte label hash then the 32/64-byte ct_X / input public key - bytes
 // 0/15/31 mod 6 (mod 3 on a DUO) plus one; the web app computes and shows it.
 // Public-key derives are never gated.
-static int web_derive_gate(uint8_t floor_mode, const uint8_t *data, int len)
+static int web_agent_derive_gate(uint8_t floor_mode, const uint8_t *data, int len)
 {
 	extern uint8_t onlykeyhw;
-	uint8_t need = okcore_web_derive_mode();
+	uint8_t need = okcore_web_agent_derive_mode();
 	// floor_mode is the weakest confirmation this CALL SITE will accept,
 	// independent of the user setting. It replaces the old REQ_PRESS opcode
 	// variants, which let the REQUEST raise the requirement: those opcodes are
@@ -371,7 +371,7 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 				// needs the whole 1120-byte X-Wing ciphertext on the device
 				// (ct_M included), which does not fit this single-shot
 				// client_handle path. The browser sends it as a chunked
-				// OKDECRYPT to slot RESERVED_KEY_WEB_DERIVATION carrying
+				// OKDECRYPT to slot RESERVED_KEY_WEB_AGENT_DERIVATION carrying
 				// [ label32 | ct(1120) ], the same tunnel composite_decrypt
 				// already uses; okcrypto_decrypt() handles it there.
 				if (opt2 == KEYTYPE_XWING) {
@@ -389,19 +389,19 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 					return ret;
 				}
 
-				//Similar format to SSH derivation but use RESERVED_KEY_WEB_DERIVATION key
+				//Similar format to SSH derivation but use RESERVED_KEY_WEB_AGENT_DERIVATION key
 				if (opt2 == KEYTYPE_NACL || opt2 == KEYTYPE_CURVE25519) {
-					okcrypto_derive_key(KEYTYPE_CURVE25519, additional_data, RESERVED_KEY_WEB_DERIVATION); //Curve25519
+					okcrypto_derive_key(KEYTYPE_CURVE25519, additional_data, RESERVED_KEY_WEB_AGENT_DERIVATION); //Curve25519
 					pubsize=32;
 				}
 				else if (opt2 == KEYTYPE_P256R1) {
-					okcrypto_derive_key(KEYTYPE_P256R1, additional_data, RESERVED_KEY_WEB_DERIVATION);
+					okcrypto_derive_key(KEYTYPE_P256R1, additional_data, RESERVED_KEY_WEB_AGENT_DERIVATION);
 					memmove(ecc_public_key+1, ecc_public_key, 64);
 					ecc_public_key[0] = 4;
 					pubsize=65;
 				}
 				else if (opt2 == KEYTYPE_P256K1) {
-					okcrypto_derive_key(KEYTYPE_P256K1, additional_data, RESERVED_KEY_WEB_DERIVATION);
+					okcrypto_derive_key(KEYTYPE_P256K1, additional_data, RESERVED_KEY_WEB_AGENT_DERIVATION);
 					memmove(ecc_public_key+1, ecc_public_key, 64);
 					ecc_public_key[0] = 4;
 					pubsize=65;
@@ -434,7 +434,7 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 						// Generate Shared Secret. The user's web-derive input
 						// mode (field 30) decides this outright, including
 						// USER_INPUT_NONE: an unattended agent using an SSH key
-						// from the web-derivation slot has to be able to run
+						// from that slot has to be able to run
 						// without a prompt, and that is the whole point of the
 						// setting. Default is a button press and no-touch is a
 						// deliberate opt-in, made in config mode.
@@ -454,7 +454,7 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 						// public data and the caller cannot turn it into a
 						// secret.
 						{
-							int g = web_derive_gate(USER_INPUT_NONE, client_handle + 43, 32 + pubsize);
+							int g = web_agent_derive_gate(USER_INPUT_NONE, client_handle + 43, 32 + pubsize);
 							if (g) return g;
 							if (os == 'W') packet_buffer_details[3] = 'W';
 						}
@@ -505,7 +505,7 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 			// Break the FIDO message into packets
 			else if (!CRYPTO_AUTH) {
 				// opt1 is the SLOT for these commands. A derived-key request
-				// (RESERVED_KEY_WEB_DERIVATION) is allowed at level 1 - it is
+				// (RESERVED_KEY_WEB_AGENT_DERIVATION) is allowed at level 1 - it is
 				// the derived X-Wing decapsulation path, which is chunked and
 				// so cannot use the single-shot OKCONNECT route. Anything
 				// naming a real slot is a stored-key operation (PGP and
@@ -518,7 +518,7 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 				// OKPING is deliberately NOT gated: it is how a large response
 				// is retrieved in MAX_LARGE_RESP_CHUNK pieces, and the derived
 				// recipient is 1216 bytes, so level 1 needs it.
-				if (wc_level < 2 && opt1 != RESERVED_KEY_WEB_DERIVATION) {
+				if (wc_level < 2 && opt1 != RESERVED_KEY_WEB_AGENT_DERIVATION) {
 					#ifdef DEBUG
 					Serial.println("Stored-key operations over FIDO2 are disabled");
 					#endif

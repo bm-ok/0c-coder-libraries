@@ -214,7 +214,21 @@ extern "C"
 #define RESERVED_KEY_DEFAULT_BACKUP 131
 #define RESERVED_KEY_HMACSHA1_1 130
 #define RESERVED_KEY_HMACSHA1_2 129
-#define RESERVED_KEY_WEB_DERIVATION 128
+/* Slot 128 - the WEB AND AGENT derivation key. Named for both because it serves
+ * both: the OnlyKey web app over FIDO2, and local tools over USB
+ * (onlykey-agent, python-onlykey, the age plugin). Calling it "web" hid the
+ * second half, which matters because the unattended-agent case runs over USB.
+ *
+ * This is deliberately the ACCESSIBLE tier, not the protected one. Keys here are
+ * reproducible from a label, reachable by the web app and by local agents, and
+ * can be configured (field 30) to need no confirmation at all. That is the
+ * trade: less protected than a stored slot, in exchange for being usable by
+ * software that has nobody sitting in front of it. Stored keys are the other
+ * end of that scale and are not reachable this way. */
+#define RESERVED_KEY_WEB_AGENT_DERIVATION 128
+/* Old name. Kept as an alias so branches still in flight keep compiling; new
+ * code should use the name above. */
+#define RESERVED_KEY_WEB_DERIVATION RESERVED_KEY_WEB_AGENT_DERIVATION
 
 /* Field 21 used to be a bitfield, then briefly an enum with policy flags packed
  * into the high nibble. It is now a plain input-mode enum (USER_INPUT_*, see
@@ -318,7 +332,7 @@ extern uint8_t user_input_mode;
 extern uint8_t pending_op_no_press;
 extern void okcore_run_pending_op();
 extern uint8_t okcore_user_input_mode_for_slot(uint8_t slot);
-extern uint8_t okcore_web_derive_mode();
+extern uint8_t okcore_web_agent_derive_mode();
 
 /* Field 31 - webcrypt policy. What the browser is ALLOWED to do over the FIDO2
  * extension, as opposed to field 30's input mode (how the user confirms it).

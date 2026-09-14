@@ -10,19 +10,19 @@
 #define OKWC_DISABLE_EXT       0x02
 #define OKWC_VALID_MASK        (OKWC_ALLOW_STORED_KEY | OKWC_DISABLE_EXT)
 #define OKWC_UNSET             0xFF
-#define RESERVED_KEY_WEB_DERIVATION 128
+#define RESERVED_KEY_WEB_AGENT_DERIVATION 128
 
 /* Simulated EEPROM */
 static uint8_t ee_f21, ee_f22, ee_f30, ee_f31;
 
 /* --- transcribed from okcore.cpp --- */
-static uint8_t okcore_web_derive_mode(void) {
+static uint8_t okcore_web_agent_derive_mode(void) {
     uint8_t mode = ee_f30;
     if (mode > USER_INPUT_NONE) mode = USER_INPUT_PRESS;
     return mode;
 }
 static uint8_t okcore_user_input_mode_for_slot(uint8_t slot) {
-    if (slot == RESERVED_KEY_WEB_DERIVATION) return okcore_web_derive_mode();
+    if (slot == RESERVED_KEY_WEB_AGENT_DERIVATION) return okcore_web_agent_derive_mode();
     uint8_t derived = (slot > 200);
     uint8_t raw = derived ? ee_f21 : ee_f22;
     uint8_t mode = raw & 0x03;
@@ -56,7 +56,7 @@ int main(void) {
        extension on, and a press (not "none") for web derive. */
     ee_f21 = ee_f22 = ee_f30 = ee_f31 = 0xFF;
     if (webcrypt_level(1) != 1) { printf("FAIL blank: level %d != 1\n", webcrypt_level(1)); fail++; }
-    if (okcore_web_derive_mode() != USER_INPUT_PRESS) { printf("FAIL blank: web derive mode not press\n"); fail++; }
+    if (okcore_web_agent_derive_mode() != USER_INPUT_PRESS) { printf("FAIL blank: web derive mode not press\n"); fail++; }
     if (okcore_user_input_mode_for_slot(210) != USER_INPUT_CHALLENGE) { printf("FAIL blank: derived slot not challenge\n"); fail++; }
     n += 3;
 

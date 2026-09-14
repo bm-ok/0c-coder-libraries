@@ -458,15 +458,15 @@ extern "C"
 #define EEpos_touchoffset (EEpos_yubicounterpart + EElen_yubicounterpart)
 #define EEpos_fwvermaj (EEpos_touchoffset + 1)
 #define EEpos_slottypespeed (EEpos_fwvermaj + EElen_slottypespeed)
-#define EElen_web_derive_mode 1
-#define EEpos_web_derive_mode (EEpos_slottypespeed + EElen_slottypespeed)
+#define EElen_web_agent_derive_mode 1
+#define EEpos_web_agent_derive_mode (EEpos_slottypespeed + EElen_slottypespeed)
 /* Webcrypt policy: WHAT the browser may do, as opposed to field 30's HOW the
  * user confirms it. Deliberately a separate byte - packing "may it happen" and
  * "how is it confirmed" into one byte is what produced the enum-versus-bitfield
  * collision in field 21. Unwritten EEPROM reads 0xFF, which okcore_webcrypt_policy()
  * treats as "never configured" and resolves from the legacy field-21 byte. */
 #define EElen_webcrypt_policy 1
-#define EEpos_webcrypt_policy (EEpos_web_derive_mode + EElen_web_derive_mode)
+#define EEpos_webcrypt_policy (EEpos_web_agent_derive_mode + EElen_web_agent_derive_mode)
 
 extern int  okeeprom_eeget_ctap_authstate (uint8_t *ptr);
 extern void okeeprom_eeset_ctap_authstate(uint8_t *ptr);
@@ -488,8 +488,8 @@ extern void okeeprom_eeset_derived_key_challenge_mode(uint8_t *ptr);
 
 extern int  okeeprom_eeget_stored_key_challenge_mode (uint8_t *ptr);
 extern void okeeprom_eeset_stored_key_challenge_mode(uint8_t *ptr);
-extern int  okeeprom_eeget_web_derive_mode (uint8_t *ptr);
-extern void okeeprom_eeset_web_derive_mode(uint8_t *ptr);
+extern int  okeeprom_eeget_web_agent_derive_mode (uint8_t *ptr);
+extern void okeeprom_eeset_web_agent_derive_mode(uint8_t *ptr);
 
 extern int  okeeprom_eeget_webcrypt_policy (uint8_t *ptr);
 extern void okeeprom_eeset_webcrypt_policy(uint8_t *ptr);

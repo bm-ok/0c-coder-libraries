@@ -234,7 +234,8 @@ void okcrypto_sign (uint8_t *buffer) {
 // ---- Derived (label-based) X-Wing over HID and FIDO2 --------------------
 //
 // Nothing is stored: the keypair is reproduced on demand from
-// (slot-128 web-derivation key, 32-byte label tag, origin). Origin is pinned to
+// (slot-128 web-and-agent derivation key, 32-byte label tag, origin). Origin is
+// pinned to
 // "onlyagent.app" so the CLI and the web app derive the same key; both hash the
 // label the same way (SHA256(utf8(label))).
 //
@@ -271,7 +272,7 @@ void okcrypto_sign (uint8_t *buffer) {
 
 /* HKDF-Expand, RFC 5869 section 2.3, with an explicit info string.
  * okcrypto_hkdf() hardwires info to SHA256(RPID) read from ctap_buffer and is
- * deliberately left untouched: the P-256 / Curve25519 / NACL web-derivation
+ * deliberately left untouched: the P-256 / Curve25519 / NACL web-and-agent
  * keytypes share it, and any change there moves keys that already exist. */
 void okcrypto_hkdf_expand (const uint8_t *prk, const uint8_t *info, size_t info_len,
                            uint8_t *out, size_t L) {
@@ -310,7 +311,7 @@ void okcrypto_xwing_derive_seed (const uint8_t *label32, uint8_t *seed_out) {
 	uint8_t salt[33] = {0};                        /* [flag 0][label32] */
 	memcpy(salt + 1, label32, 32);
 
-	okcore_flashget_ECC(RESERVED_KEY_WEB_DERIVATION);   /* IKM -> ecc_private_key */
+	okcore_flashget_ECC(RESERVED_KEY_WEB_AGENT_DERIVATION);   /* IKM -> ecc_private_key */
 
 	SHA256 h;                                      /* HKDF-Extract, RFC 5869 2.2 */
 	uint8_t prk[32];
@@ -425,7 +426,7 @@ void okcrypto_getpubkey (uint8_t *buffer) {
 	} else if (buffer[5] == RESERVED_KEY_DERIVATION && buffer[6] <= KEYTYPE_CURVE25519) { // Generate key using provided data, return public
 	okcrypto_derive_key(buffer[6], buffer+7, NULL);
 	send_transport_response(ecc_public_key, 64, false, false);
-	} else if (buffer[5] == RESERVED_KEY_WEB_DERIVATION && (buffer[6] & 0x0F) == KEYTYPE_XWING) {
+	} else if (buffer[5] == RESERVED_KEY_WEB_AGENT_DERIVATION && (buffer[6] & 0x0F) == KEYTYPE_XWING) {
 		// Derived X-Wing recipient: buffer[7..39] = 32-byte label tag.
 		// Returns the full public recipient [ pk_M(1184) | pk_X(32) ] - the same
 		// XWING_PK_SIZE payload okcrypto_xwing_getpubkey() returns for a stored
@@ -471,7 +472,7 @@ void okcrypto_decrypt (uint8_t *buffer){
 	Serial.println();
 	Serial.println("OKDECRYPT MESSAGE RECEIVED");
 	#endif
-	if (buffer[5] == RESERVED_KEY_WEB_DERIVATION) {
+	if (buffer[5] == RESERVED_KEY_WEB_AGENT_DERIVATION) {
 		// Derived X-Wing decaps over HID (split custody): label(32)+ct_X(32)
 		// =64B exceeds one 57-byte HID report, so the host
 		// (derive_decaps(), onlykey_hid.py) sends it via
@@ -497,7 +498,7 @@ void okcrypto_decrypt (uint8_t *buffer){
 		// dead code given the above, never actually reached; moot now that
 		// this reassembles into its own right-sized buffer below instead of
 		// reading straight out of the raw per-report buffer.)
-		// RESERVED_KEY_WEB_DERIVATION (128) is unique within OKDECRYPT's
+		// RESERVED_KEY_WEB_AGENT_DERIVATION (128) is unique within OKDECRYPT's
 		// dispatch, so buffer[5] alone is enough to recognize every chunk of
 		// this request.
 		//
@@ -602,7 +603,7 @@ void okcrypto_decrypt (uint8_t *buffer){
 			sha256_update(&ch, derive_label, 32);
 			sha256_update(&ch, large_buffer, XWING_CT_SIZE);
 			sha256_final(&ch, chmsg);
-			okcore_prime_user_confirmation(OKDECRYPT, RESERVED_KEY_WEB_DERIVATION,
+			okcore_prime_user_confirmation(OKDECRYPT, RESERVED_KEY_WEB_AGENT_DERIVATION,
 			                               chmsg, sizeof(chmsg));
 			memset(chmsg, 0, sizeof(chmsg));
 		}
@@ -861,11 +862,11 @@ void okcrypto_derive_key (uint8_t ktype, uint8_t *data, uint8_t slot) {
 		Serial.println("Agent derivation private key");
 		byteprint(ecc_private_key,32);
 		#endif
-  	} else if (slot==RESERVED_KEY_WEB_DERIVATION) { //HMAC SHA256 KDF used for web requests
+  	} else if (slot==RESERVED_KEY_WEB_AGENT_DERIVATION) { //HMAC SHA256 KDF used for web requests
 	  	okcore_flashget_ECC (slot); 
 		#ifdef DEBUG
 		Serial.println();
-		Serial.println("Web derivation key");
+		Serial.println("Web and agent derivation key");
 		byteprint(ecc_private_key,32);
 		Serial.println("Other data");
 		byteprint(data,33);
@@ -919,13 +920,13 @@ void okcrypto_ecdsa_eddsa(uint8_t *buffer)
 			else if (buffer[5] == 203) {
 				okcrypto_derive_key(3, large_buffer+(large_buffer_offset-32), NULL);
 			} else if (buffer[5] == 211) {
-				okcrypto_derive_key(1, large_buffer+(large_buffer_offset-32), RESERVED_KEY_WEB_DERIVATION);
+				okcrypto_derive_key(1, large_buffer+(large_buffer_offset-32), RESERVED_KEY_WEB_AGENT_DERIVATION);
 			}
 			else if (buffer[5] == 212) {
-				okcrypto_derive_key(2, large_buffer+(large_buffer_offset-32), RESERVED_KEY_WEB_DERIVATION);
+				okcrypto_derive_key(2, large_buffer+(large_buffer_offset-32), RESERVED_KEY_WEB_AGENT_DERIVATION);
 			}
 			else if (buffer[5] == 213) {
-				okcrypto_derive_key(3, large_buffer+(large_buffer_offset-32), RESERVED_KEY_WEB_DERIVATION);
+				okcrypto_derive_key(3, large_buffer+(large_buffer_offset-32), RESERVED_KEY_WEB_AGENT_DERIVATION);
 			}
 			large_buffer_offset = large_buffer_offset - 32;
 		}
@@ -1038,13 +1039,13 @@ void okcrypto_ecdh(uint8_t *buffer) {
 			else if (buffer[5] == 204) {
 				okcrypto_derive_key(4, large_buffer+(large_buffer_offset-32), NULL); 
 			} else if (buffer[5] == 212) {
-				okcrypto_derive_key(2, large_buffer+(large_buffer_offset-32), RESERVED_KEY_WEB_DERIVATION);
+				okcrypto_derive_key(2, large_buffer+(large_buffer_offset-32), RESERVED_KEY_WEB_AGENT_DERIVATION);
 			}
 			else if (buffer[5] == 213) {
-				okcrypto_derive_key(3, large_buffer+(large_buffer_offset-32), RESERVED_KEY_WEB_DERIVATION);
+				okcrypto_derive_key(3, large_buffer+(large_buffer_offset-32), RESERVED_KEY_WEB_AGENT_DERIVATION);
 			} 
 			else if (buffer[5] == 214) {
-				okcrypto_derive_key(4, large_buffer+(large_buffer_offset-32), RESERVED_KEY_WEB_DERIVATION); 
+				okcrypto_derive_key(4, large_buffer+(large_buffer_offset-32), RESERVED_KEY_WEB_AGENT_DERIVATION); 
 			} 
 			large_buffer_offset = large_buffer_offset - 32; //Remove derivation data hash
 		}

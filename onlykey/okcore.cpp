@@ -2055,9 +2055,12 @@ void set_slot(uint8_t *buffer)
 		}
 		break;
 	case 30:
-		// Web derived key user input mode (web app / OnlyAgent, over FIDO2 or
-		// raw HID slot 128): 0 = challenge code, 1 = button press (default),
-		// 2 = no press. The key itself never depends on this setting - press
+		// User input mode for the web-derivation slot (128), on BOTH transports:
+		// the FIDO2 DERIVE_* extension and raw HID. okcore_user_input_mode_for_slot()
+		// routes slot 128 straight here, so a local agent over USB is governed by
+		// this byte exactly as the web app is - which is the point, since the
+		// unattended-agent case runs over HID, not the browser.
+		// 0 = challenge code, 1 = button press (default), 2 = no press. The key itself never depends on this setting - press
 		// choice is authorisation only, so a file encrypted to a label always
 		// decrypts whatever this is set to.
 		//

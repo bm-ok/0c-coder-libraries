@@ -156,9 +156,12 @@ static int web_derive_gate(uint8_t floor_mode, const uint8_t *data, int len)
 	// independent of the user setting. It replaces the old REQ_PRESS opcode
 	// variants, which let the REQUEST raise the requirement: those opcodes are
 	// gone (one label, one key), and a per-request knob was the wrong shape
-	// anyway - whether a confirmation is required follows from what is being
-	// asked for, not from which opcode a page chose to send. The setting can
-	// still pick a STRONGER confirmation than the floor.
+	// anyway - a page asking politely for a prompt is not a security control.
+	//
+	// Every call site currently passes USER_INPUT_NONE, i.e. the user setting
+	// decides outright. The parameter stays because a future operation may
+	// genuinely need a floor, and because a call site that wants one should
+	// have to say so rather than inherit it.
 	if (need == USER_INPUT_NONE && floor_mode != USER_INPUT_NONE) need = floor_mode;
 	if (need == USER_INPUT_NONE) return 0;
 	int but;
@@ -429,15 +432,29 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 					}
 					else { 
 						// Generate Shared Secret. The user's web-derive input
-						// mode (field 30) chooses BETWEEN a challenge code and a
-						// plain press - but not whether to confirm at all. A
-						// shared secret is a decryption capability, so
-						// USER_INPUT_PRESS is the floor here and "none" cannot
-						// reach this call. Public-key derivation is ungated: it
-						// is public data, and the caller cannot turn that into a
+						// mode (field 30) decides this outright, including
+						// USER_INPUT_NONE: an unattended agent using an SSH key
+						// from the web-derivation slot has to be able to run
+						// without a prompt, and that is the whole point of the
+						// setting. Default is a button press and no-touch is a
+						// deliberate opt-in, made in config mode.
+						//
+						// An earlier revision floored this at a press on the
+						// reasoning that a shared secret is a decryption
+						// capability. It is - but the floor made the setting a
+						// lie, and the unattended-agent case is exactly what
+						// field 30 exists for. Note the consequence plainly: with
+						// field 30 set to 2, any request from a trusted origin
+						// derives and decapsulates silently for as long as the
+						// key is unlocked. That is the bargain the setting makes,
+						// and it is why it is off by default and why it takes
+						// config mode to change.
+						//
+						// Public-key derivation is ungated regardless: it is
+						// public data and the caller cannot turn it into a
 						// secret.
 						{
-							int g = web_derive_gate(USER_INPUT_PRESS, client_handle + 43, 32 + pubsize);
+							int g = web_derive_gate(USER_INPUT_NONE, client_handle + 43, 32 + pubsize);
 							if (g) return g;
 							if (os == 'W') packet_buffer_details[3] = 'W';
 						}

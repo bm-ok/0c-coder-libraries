@@ -132,7 +132,10 @@ int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
         // user has explicitly opted in to stored-key operations over FIDO2.
         // Level 2 is what unlocks the OKDECRYPT/OKSIGN tunnel in
         // ok_extension.cpp, i.e. PGP and any other operation against a REAL
-        // slot, with the slot number chosen by the web page.
+        // slot, with the slot number chosen by the caller. "Caller" here is
+        // Webcrypt - the OnlyKey web app - not a web page in general: the
+        // origins that reach this code are the three compiled in above, and
+        // there is no list a user can add to.
         //
         // This used to return 2 unconditionally, so every trusted origin could
         // sign and decrypt with any slot on an unlocked key, and a user who
@@ -148,7 +151,7 @@ int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
     // message was an OKCONNECT. The allowed origins are compiled into this
     // function on purpose; a user-settable bypass of that list is not a setting
     // anyone needs, and it is the one setting whose misuse hands an arbitrary
-    // web page a derivation oracle.
+    // arbitrary origin a derivation oracle.
     else return 0;
 }
 

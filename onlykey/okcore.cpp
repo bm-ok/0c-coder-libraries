@@ -2061,11 +2061,15 @@ void set_slot(uint8_t *buffer)
 		// choice is authorisation only, so a file encrypted to a label always
 		// decrypts whatever this is set to.
 		//
-		// 2 does NOT reach a shared-secret derivation. Call sites pass a floor
-		// to web_derive_gate() / okcore_prime_user_confirmation(), and a shared
-		// secret - a decryption capability - floors at a press. What 2 actually
-		// buys is ungated PUBLIC-KEY derivation, which is public data. This is
-		// what makes field 30 safe to expose as a plain three-way setting.
+		// 2 means what it says, including for a shared secret: an unattended
+		// agent using an SSH key from the web-derivation slot has to be able to
+		// run without a prompt, and that is what this setting is for. With it
+		// set, any request from a trusted origin derives and decapsulates
+		// silently while the key is unlocked - which is why it is off by
+		// default and why changing it takes config mode.
+		//
+		// Public-key derivation is ungated at every setting: it is public data
+		// and the caller cannot turn it into a secret.
 		if (configmode == true || !initcheck)
 		{
 			if (buffer[7] > USER_INPUT_NONE) { hidprint("Error invalid user input mode"); break; }

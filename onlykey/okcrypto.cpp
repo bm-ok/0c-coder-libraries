@@ -647,6 +647,21 @@ void okcrypto_decrypt (uint8_t *buffer){
 			memset(chmsg, 0, sizeof(chmsg));
 		}
 		pending_operation = OKDECRYPT_ERR_USER_ACTION_PENDING;
+		// Actually SIGNAL that input is wanted.
+		//
+		// okcore_prime_user_confirmation() sets isfade and CRYPTO_AUTH but never
+		// starts FadeinTask, so on its own the LED does not pulse - it just
+		// holds whatever solid colour was last set. Every other confirmation
+		// reaches the user through done_process_packets(), which ends with
+		// fadeon(NEO_Color); this path returned straight to the caller instead
+		// and so was the only confirmation on the device with no visible
+		// prompt at all.
+		//
+		// Reported from hardware 2026-09-15: "solid yellow then green" across
+		// three attempts, and correctly read as NOT a request for input - a
+		// waiting OnlyKey pulses. The operation was in fact waiting, and timed
+		// out after 20 s having never asked for anything.
+		fadeon(NEO_Color);
 		return;
 	}
 	if (buffer[5] < 101) { //Slot 101-132 are for ECC, 1-4 are for RSA

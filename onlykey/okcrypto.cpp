@@ -579,6 +579,33 @@ void okcrypto_decrypt (uint8_t *buffer){
 		const int derive_total = 32 + XWING_CT_SIZE;
 		int n = (buffer[6] == 0xFF) ? 57 : buffer[6];
 
+		// The FINAL report's length is the keyhandle's data length, and
+		// encode_ctaphid_request_as_keyhandle() zero-pads every keyhandle up to
+		// 16 bytes of data because is_extension_request() needs that much to
+		// match. A genuine tail shorter than 16 therefore arrives claiming 16,
+		// and the host has no way to say otherwise.
+		//
+		// [label32 | ct1120] is 1152 bytes and 1152 = 20*57 + 12, so this tail
+		// is ALWAYS 12 bytes and always claims 16. No host-side chunk size
+		// avoids it: ok_extension.cpp re-chunks into 57-byte reports and counts
+		// every non-final one as a full 57, so every host chunk but the last
+		// must be a multiple of 57 - which fixes the final remainder at
+		// 1152 mod 57 regardless of how the payload is split.
+		//
+		// Measured on hardware 2026-09-15: 21 reports arrived, derive_offset
+		// reached 1156 against a 1152 expectation, and a correct ciphertext was
+		// dropped with "Error derived decaps payload size" over four bytes of
+		// transport padding.
+		//
+		// So trust derive_total over the padded length, for the last report
+		// only and only when the overshoot is small enough to BE padding.
+		// Anything larger is still a desynchronised request and still dropped:
+		// this must not become the silent truncation TC-17 was.
+		if (buffer[6] != 0xFF && derive_offset + n > derive_total
+		    && derive_offset + n - derive_total < 16) {
+			n = derive_total - derive_offset;
+		}
+
 		if (n < 0 || derive_offset + n > derive_total) {
 			// Overlong or desynchronised: drop the whole request rather than
 			// decapsulate against a half-filled buffer. Silent truncation here

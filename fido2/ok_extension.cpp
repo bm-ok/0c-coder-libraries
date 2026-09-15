@@ -383,9 +383,29 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 					}
 					const int hdr = 32 + sizeof(UNLOCKED) + 1;
 					memmove(large_resp_buffer, temp, hdr);   /* transit pubkey + status */
+					#ifdef DEBUG
+					Serial.print("XWING derive start ms=");
+					Serial.println(millis());
+					#endif
 					okcrypto_xwing_derive_getpubkey(label32, large_resp_buffer + hdr);
+					#ifdef DEBUG
+					Serial.print("XWING derive done ms=");
+					Serial.print(millis());
+					Serial.print(" hdr=");
+					Serial.print(hdr);
+					Serial.print(" total=");
+					Serial.println(hdr + XWING_PK_SIZE);
+					#endif
 					send_transport_response(large_resp_buffer, hdr + XWING_PK_SIZE, opt3, false);
 					ret = send_stored_response(output, opt3);
+					#ifdef DEBUG
+					Serial.print("XWING derive ret=");
+					Serial.print(ret);
+					Serial.print(" staged=");
+					Serial.print(large_resp_buffer_offset);
+					Serial.print(" cursor=");
+					Serial.println(large_resp_buffer_cursor);
+					#endif
 					return ret;
 				}
 
@@ -600,17 +620,38 @@ int16_t send_stored_response(uint8_t * output, uint8_t opt3) {
 			// ~513 B usable), so a full response may take several OKPING
 			// polls. large_resp_buffer_cursor tracks what has been delivered.
 			//
-			// opt3 <= large_resp_buffer_last_opt3 means this poll duplicates
-			// the one just answered (the Windows 10 1903 double-fire this file
-			// guards against elsewhere via packet_buffer_details[3]) - re-serve
-			// the same bytes rather than advancing, or a duplicate silently
-			// skips a chunk and corrupts the reassembled response.
-			int is_duplicate = large_resp_buffer_last_opt3 && opt3 <= large_resp_buffer_last_opt3;
+			// A non-zero opt3 that is <= large_resp_buffer_last_opt3 means this
+			// poll duplicates the one just answered (the Windows 10 1903
+			// double-fire this file guards against elsewhere via
+			// packet_buffer_details[3]) - re-serve the same bytes rather than
+			// advancing, or a duplicate silently skips a chunk and corrupts the
+			// reassembled response.
+			//
+			// opt3 == 0 carries no sequence information and must never be read
+			// as a duplicate: poll_for_response() in the web app sends OKPING
+			// with opt3 = 0, while the request that filled the buffer (e.g.
+			// DERIVE_PUBLIC_KEY) sets last_opt3 = 1. Treating those polls as
+			// duplicates re-served chunk 1 forever and the cursor never moved.
+			int is_duplicate = opt3 && large_resp_buffer_last_opt3 && opt3 <= large_resp_buffer_last_opt3;
 			int chunk_start = is_duplicate
 				? (large_resp_buffer_cursor > MAX_LARGE_RESP_CHUNK ? large_resp_buffer_cursor - MAX_LARGE_RESP_CHUNK : 0)
 				: large_resp_buffer_cursor;
 			int remaining = large_resp_buffer_offset - chunk_start;
 			int chunk_len = remaining > MAX_LARGE_RESP_CHUNK ? MAX_LARGE_RESP_CHUNK : remaining;
+			#ifdef DEBUG
+			Serial.print("chunk opt3=");
+			Serial.print(opt3);
+			Serial.print(" last=");
+			Serial.print(large_resp_buffer_last_opt3);
+			Serial.print(" dup=");
+			Serial.print(is_duplicate);
+			Serial.print(" start=");
+			Serial.print(chunk_start);
+			Serial.print(" len=");
+			Serial.print(chunk_len);
+			Serial.print(" of=");
+			Serial.println(large_resp_buffer_offset);
+			#endif
 			extension_writeback_init(output, chunk_len);
 			extension_writeback(large_resp_buffer + chunk_start, chunk_len);
 			if (!is_duplicate) {

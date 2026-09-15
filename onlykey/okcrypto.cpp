@@ -338,24 +338,34 @@ void okcrypto_xwing_derive_seed (const uint8_t *label32, uint8_t *seed_out) {
 	memset(ecc_private_key, 0, sizeof(ecc_private_key));
 }
 
-/* Derived recipient. out must be XWING_PK_SIZE (1216) bytes.
- * Same expansion and layout as okcrypto_xwing_getpubkey().
+/* ML-KEM scratch for the two DERIVED X-Wing entry points.
  *
- * UNRESOLVED - MUST be settled before this ships. Both derive entry points use
- * ctap_buffer as ML-KEM scratch (sk_M 2400 + pk_M 1184 = 3584 B) and wipe it,
- * copying okcrypto_xwing_getpubkey()/_decaps(). That is safe for the stored
- * path, which is only ever reached from okcore.cpp's raw-HID dispatch. It is
- * NOT obviously safe here: the derived path is ALSO reached from inside
- * ok_extension.cpp, where ctap_buffer holds the in-flight CTAP request. The
- * label survives (client_handle is a local 256-byte copy, ok_extension.cpp:161)
- * but anything the extension still needs from ctap_buffer after this call is
- * clobbered - and the old code only ever wrote 14 bytes there (the RPID
- * staging), so this is a much larger blast radius than anything that path has
- * survived before. Either confirm on HARDWARE that nothing downstream reads
- * ctap_buffer after the extension calls this, or give the derived path its own
- * scratch (the tail of ctap_buffer above the largest possible CTAP request, or
- * a dedicated 3584-byte buffer if the RAM budget allows). Do not assume the
- * emulator settles it. */
+ * The stored-slot functions (okcrypto_xwing_getpubkey()/_decaps()) scratch at
+ * the BASE of ctap_buffer, which is safe for them: they are only ever reached
+ * from okcore.cpp's raw-HID dispatch, where no CTAP request is in flight.
+ *
+ * The derived pair is different - it is also reached from inside
+ * ok_extension.cpp, in the middle of servicing a CTAPHID getAssertion whose
+ * request bytes ARE ctap_buffer. Scratching at the base wrote 3584 bytes over
+ * that live request and then zeroed them, so the assertion the browser got back
+ * was built on a wiped buffer. Symptom: the derive call rejected with
+ * NotAllowedError while a plain OKCONNECT over the identical path succeeded,
+ * and no error printed on either side because nothing in the chain treats a
+ * clobbered request as a failure.
+ *
+ * So the derived path scratches in the TAIL instead, above anything a request
+ * that reaches it can occupy. The bound is not a guess: bridge_to_onlykey()
+ * copies the keyhandle into a 256-byte local (ok_extension.cpp) and the rest of
+ * such a getAssertion is the rpId, clientDataHash and CBOR framing - low
+ * hundreds of bytes against the 3001 left below the scratch. The static assert
+ * keeps that true if either size moves. */
+#define XWING_DERIVE_SCRATCH_SIZE  (MLKEM_SK_SIZE + MLKEM_PK_SIZE)   /* 3584 */
+#define XWING_DERIVE_SCRATCH_OFF   (CTAPHID_BUFFER_SIZE - XWING_DERIVE_SCRATCH_SIZE)
+static_assert(XWING_DERIVE_SCRATCH_OFF >= 2048,
+	"ctap_buffer tail scratch would collide with an in-flight CTAP request");
+
+/* Derived recipient. out must be XWING_PK_SIZE (1216) bytes.
+ * Same expansion and layout as okcrypto_xwing_getpubkey(). */
 void okcrypto_xwing_derive_getpubkey (const uint8_t *label32, uint8_t *out) {
 	extern uint8_t ctap_buffer[CTAPHID_BUFFER_SIZE];
 	uint8_t seed[32];
@@ -364,8 +374,9 @@ void okcrypto_xwing_derive_getpubkey (const uint8_t *label32, uint8_t *out) {
 	okcrypto_xwing_derive_seed(label32, seed);
 	xwing_shake256(expanded, 96, seed, XWING_SEED_SIZE);
 
-	uint8_t *sk_M = ctap_buffer;
-	uint8_t *pk_M = ctap_buffer + MLKEM_SK_SIZE;
+	uint8_t *scratch = ctap_buffer + XWING_DERIVE_SCRATCH_OFF;
+	uint8_t *sk_M = scratch;
+	uint8_t *pk_M = scratch + MLKEM_SK_SIZE;
 	crypto_kem_keypair_derand(pk_M, sk_M, expanded);
 
 	memcpy(out, pk_M, MLKEM_PK_SIZE);
@@ -373,7 +384,7 @@ void okcrypto_xwing_derive_getpubkey (const uint8_t *label32, uint8_t *out) {
 
 	memset(seed, 0, sizeof(seed));
 	memset(expanded, 0, sizeof(expanded));
-	memset(ctap_buffer, 0, MLKEM_SK_SIZE + MLKEM_PK_SIZE);
+	memset(scratch, 0, XWING_DERIVE_SCRATCH_SIZE);
 }
 
 /* Derived decapsulation. ct is XWING_CT_SIZE (1120) = ct_M(1088) || ct_X(32);
@@ -385,8 +396,9 @@ int okcrypto_xwing_derive_decaps (const uint8_t *label32, const uint8_t *ct, uin
 	uint8_t seed[32];
 	uint8_t expanded[96];
 	uint8_t ss_M[32], ss_X[32], pk_X[32];
-	uint8_t *sk_M = ctap_buffer;
-	uint8_t *pk_M = ctap_buffer + MLKEM_SK_SIZE;
+	uint8_t *scratch = ctap_buffer + XWING_DERIVE_SCRATCH_OFF;   /* see note above */
+	uint8_t *sk_M = scratch;
+	uint8_t *pk_M = scratch + MLKEM_SK_SIZE;
 	int rc = -1;
 
 	okcrypto_xwing_derive_seed(label32, seed);
@@ -406,7 +418,7 @@ int okcrypto_xwing_derive_decaps (const uint8_t *label32, const uint8_t *ct, uin
 	memset(ss_M, 0, sizeof(ss_M));
 	memset(ss_X, 0, sizeof(ss_X));
 	memset(pk_X, 0, sizeof(pk_X));
-	memset(ctap_buffer, 0, MLKEM_SK_SIZE + MLKEM_PK_SIZE);
+	memset(scratch, 0, XWING_DERIVE_SCRATCH_SIZE);
 	return rc;
 }
 

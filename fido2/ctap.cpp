@@ -1054,8 +1054,42 @@ static uint8_t ctap_add_credential_descriptor(CborEncoder * map, struct Credenti
         ret = cbor_encode_text_string(&desc, "id", 2);
         check_ret(ret);
 
-        ret = cbor_encode_byte_string(&desc, (uint8_t*)&cred->id,
-            get_credential_id_size(type));
+        // OnlyKey required change start
+        //
+        // Echo the credential id the client actually asked for, all of it.
+        //
+        // For PUB_KEY_CRED_CUSTOM the whole id lives in
+        // getAssertionState.customCredId (256 B). cred->id is a CredentialId -
+        // 70 bytes - and ctap_parse.cpp only mirrors a bounded PREFIX into it.
+        // Encoding get_credential_id_size() == customCredIdSize bytes starting
+        // at &cred->id therefore read past the field for any id longer than 70:
+        // the first 70 bytes were right and the rest came from the `user`
+        // entity that follows it in struct Credential.
+        //
+        // WebAuthn clients check the returned credential against allowCredentials.
+        // A response whose id does not match is not an error they report - it is
+        // one they DISCARD, and then keep waiting for a valid one. Measured on
+        // hardware 2026-09-15 in Brave: a 70-byte keyhandle resolved in 1198 ms,
+        // a 71-byte one never resolved at all - not even at its own timeout -
+        // and the page sat there until navigator.credentials.get() was abandoned
+        // and reported NotAllowedError. The device was healthy throughout and
+        // had already sent a correct response.
+        //
+        // Every derived-key request is over that line: the 32-byte label tag
+        // puts the keyhandle at 85 bytes. That is why DERIVE_PUBLIC_KEY failed
+        // in the browser for every keytype and every response size while plain
+        // OKCONNECT (53 bytes) worked, and why the HID transport - which never
+        // goes near a credential descriptor - was unaffected.
+        const uint8_t * id_bytes = (const uint8_t*)&cred->id;
+        unsigned int id_size = get_credential_id_size(type);
+        if (type == PUB_KEY_CRED_CUSTOM)
+        {
+            id_bytes = getAssertionState.customCredId;
+            if (id_size > sizeof(getAssertionState.customCredId))
+                id_size = sizeof(getAssertionState.customCredId);
+        }
+        ret = cbor_encode_byte_string(&desc, id_bytes, id_size);
+        // OnlyKey required change end
         check_ret(ret);
     }
 

@@ -182,6 +182,14 @@ void store_FIDO_response (uint8_t *data, int len, uint8_t encrypt) {
       // that is not the payload.
       if (data >= large_resp_buffer && data < large_resp_buffer + LARGE_RESP_BUFFER_SIZE) {
         int used = (int)(data - large_resp_buffer) + len;
+        // The size guard at the top of this function checks `len` alone, which
+        // is only sufficient while `data` is the start of the buffer. For a
+        // payload staged at an offset, used can exceed LARGE_RESP_BUFFER_SIZE,
+        // and LARGE_RESP_BUFFER_SIZE - used then goes negative - a huge size_t
+        // to memset, writing off the end. No current caller stages high enough
+        // to reach it, so clamp rather than reject: the tail simply has nothing
+        // left to clear.
+        if (used > (int)LARGE_RESP_BUFFER_SIZE) used = (int)LARGE_RESP_BUFFER_SIZE;
         memset(large_resp_buffer, 0, (int)(data - large_resp_buffer));
         memset(large_resp_buffer + used, 0, LARGE_RESP_BUFFER_SIZE - used);
       } else {

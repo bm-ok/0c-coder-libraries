@@ -187,7 +187,12 @@ void okpqc_sign(uint8_t *buffer)
      *
      * Guarded so it cannot reach a production build: it exports private key
      * material by design. */
-#ifdef DEBUG
+/* Second gate, deliberately separate from DEBUG. DEBUG is on for ordinary
+ * bring-up and hardware testing, and nobody enabling serial logging expects to
+ * also enable a command that hands the host a raw ML-DSA private seed. Exporting
+ * private key material needs its own switch that has to be turned on on
+ * purpose. */
+#if defined(DEBUG) && defined(OK_ALLOW_PQC_SEED_EXPORT)
     if (sel == PQC_HALF_PQC_SEED) {
         pending_operation = CTAP2_ERR_DATA_READY;
         memset(large_buffer, 0, LARGE_BUFFER_SIZE);

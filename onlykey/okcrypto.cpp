@@ -555,6 +555,15 @@ void okcrypto_decrypt (uint8_t *buffer){
 				return;
 			}
 			derive_pending = 0;
+			#ifdef DEBUG
+			Serial.print("DECAP-AT-CONFIRM label ");
+			for (int d = 0; d < 4; d++) { Serial.print(derive_label[d]); Serial.print(","); }
+			Serial.print(" ct ");
+			for (int d = 0; d < 4; d++) { Serial.print(large_buffer[d]); Serial.print(","); }
+			Serial.print("|");
+			for (int d = XWING_CT_SIZE - 4; d < XWING_CT_SIZE; d++) { Serial.print(large_buffer[d]); Serial.print(","); }
+			Serial.println();
+			#endif
 			uint8_t ss[XWING_SS_SIZE];
 			if (okcrypto_xwing_derive_decaps(derive_label, large_buffer, ss) != 0) {
 				hidprint("Error X-Wing derived decaps failed");
@@ -631,6 +640,15 @@ void okcrypto_decrypt (uint8_t *buffer){
 		}
 		derive_offset = 0;
 		derive_pending = 1;
+		#ifdef DEBUG
+		Serial.print("DECAP-AT-PRIME label ");
+		for (int d = 0; d < 4; d++) { Serial.print(derive_label[d]); Serial.print(","); }
+		Serial.print(" ct ");
+		for (int d = 0; d < 4; d++) { Serial.print(large_buffer[d]); Serial.print(","); }
+		Serial.print("|");
+		for (int d = XWING_CT_SIZE - 4; d < XWING_CT_SIZE; d++) { Serial.print(large_buffer[d]); Serial.print(","); }
+		Serial.println();
+		#endif
 
 		// Prime the confirmation over the whole reassembled request. Two
 		// updates rather than one concatenated buffer: there is no 1152-byte

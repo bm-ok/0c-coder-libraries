@@ -214,10 +214,41 @@ uint8_t transit_key[32];
 static uint8_t last_request_opt3 = 0;
 
 
+/* Bytes of `keyh` consumed by the OnlyKey request header before the payload:
+ * cmd, opt1, opt2, opt3, then the 4-byte wallet tag and 2 more. */
+#define OK_KEYHANDLE_HEADER_LEN 10
+
 int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint8_t * output) {
     int8_t ret = 0;
 	uint8_t client_handle[256];
-	handle_len-=10;
+
+	/* handle_len is the length of an attacker-supplied WebAuthn credential id,
+	 * and it arrives here BEFORE any origin or unlock check - the webcryptcheck()
+	 * gate is 20 lines below. Unchecked, `handle_len -= 10` on a shorter id went
+	 * negative and the memcpy below took it as a size_t: an unbounded write into
+	 * a 256-byte stack frame, on a part with no MMU and no stack canary, from any
+	 * web page with no PIN and no trusted origin.
+	 *
+	 * It was reachable because the size gate and the size USED were different
+	 * numbers. ctap_get_assertion()/ctap_filter_invalid_credentials() decide a
+	 * custom credential is an extension request by calling is_extension_request()
+	 * with the CONSTANT sizeof(CredentialId) (68), which trivially clears its
+	 * `len < WALLET_MIN_LENGTH` guard, while what gets passed here as handle_len
+	 * is the real getAssertionState.customCredIdSize. A 9-byte id sails through
+	 * the first and underflows the second. (customCredIdSize is a uint8_t, so a
+	 * 256-byte id truncating to 0 underflows the same way.)
+	 *
+	 * Check the length actually being used, at the point it is used, rather than
+	 * relying on a caller's separate opinion of it. The U2F sibling path already
+	 * gates on the real key-handle length; this is the FIDO2 path catching up. */
+	if (handle_len < OK_KEYHANDLE_HEADER_LEN || handle_len > (int)sizeof(client_handle)) {
+		#ifdef DEBUG
+		Serial.print("Rejecting keyhandle of length ");
+		Serial.println(handle_len, DEC);
+		#endif
+		return 0;
+	}
+	handle_len-=OK_KEYHANDLE_HEADER_LEN;
 	uint8_t cmd = keyh[0];
 	uint8_t opt1 = keyh[1]; 
 	uint8_t opt2 = keyh[2];
@@ -228,7 +259,7 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 	uint8_t pubsize;
 	extern uint8_t derived_key_challenge_mode;
 
-	memcpy(client_handle, keyh+10, handle_len);
+	memcpy(client_handle, keyh+OK_KEYHANDLE_HEADER_LEN, handle_len);
 		
 	#ifdef DEBUG
     Serial.println("Keyhandle:");

@@ -1606,7 +1606,16 @@ void set_slot(uint8_t *buffer)
 	Serial.print("Value #");
 	Serial.println((int)value, DEC);
 	#endif
-	for (int z = 0; buffer[z + 7] + buffer[z + 8] + buffer[z + 9] + buffer[z + 10] != 0x00; z++)
+	/* The payload lives in recv_buffer[7..63] - 57 bytes. This scan used to run
+	 * until it happened to find four consecutive zero bytes, with no upper
+	 * bound, so a fully non-zero packet walked off the end of recv_buffer into
+	 * whatever .bss follows and produced a `length` larger than the packet. That
+	 * length is then handed to okcore_aes_gcm_encrypt(buffer+7, ..., length),
+	 * which transforms IN PLACE - an out-of-bounds read and write past
+	 * recv_buffer, sized by whatever the neighbouring globals happened to hold.
+	 * Stop at the end of the packet; z+10 must stay inside it. */
+	for (int z = 0; (z + 10) < 64 &&
+	                buffer[z + 7] + buffer[z + 8] + buffer[z + 9] + buffer[z + 10] != 0x00; z++)
 	{
 		length = z + 1;
 	#ifdef DEBUG
@@ -3932,6 +3941,15 @@ void okcore_flashset_url(uint8_t *ptr, int size, int slot)
 	uint8_t temp[2048];
 	uint8_t *tptr;
 	tptr = temp;
+	/* The write below is temp[EElen_url * (slot - 1) + z] into a 2048-byte stack
+	 * buffer, so the slot IS the offset. Nothing upstream bounded it: set_slot()
+	 * takes it straight from recv_buffer[5] and, unlike wipe_slot(), never
+	 * range-checked it before calling here. slot=0 underflowed the buffer and a
+	 * large slot wrote kilobytes past it, every byte attacker-supplied, on a
+	 * part with no MMU and no stack canary. Check it where the offset is
+	 * computed, so every caller is covered rather than one of them. */
+	if (slot < 1 || (size_t)(EElen_url * slot) > sizeof(temp))
+		return;
 	//Copy current flash contents to buffer
 	okcore_flashget_common(tptr, (unsigned long *)adr, 2048);
 	//Add new flash contents to buffer
@@ -4430,6 +4448,15 @@ void okcore_flashset_username(uint8_t *ptr, int size, int slot)
 	uint8_t temp[2048];
 	uint8_t *tptr;
 	tptr = temp;
+	/* The write below is temp[EElen_username * (slot - 1) + z] into a 2048-byte stack
+	 * buffer, so the slot IS the offset. Nothing upstream bounded it: set_slot()
+	 * takes it straight from recv_buffer[5] and, unlike wipe_slot(), never
+	 * range-checked it before calling here. slot=0 underflowed the buffer and a
+	 * large slot wrote kilobytes past it, every byte attacker-supplied, on a
+	 * part with no MMU and no stack canary. Check it where the offset is
+	 * computed, so every caller is covered rather than one of them. */
+	if (slot < 1 || (size_t)(EElen_username * slot) > sizeof(temp))
+		return;
 	//Copy current flash contents to buffer
 	okcore_flashget_common(tptr, (unsigned long *)adr, 2048);
 	//Add new flash contents to buffer
@@ -4713,7 +4740,11 @@ void okcore_flashset_label(uint8_t *ptr, uint8_t slot)
 	uint8_t temp[2048];
 	uint8_t *tptr;
 	tptr = temp;
-	if (slot > 127)
+	/* Was `slot > 127` only, which stopped the overflow but not the underflow:
+	 * slot=0 wrote temp[-16..-1], 16 attacker-supplied bytes below a 2048-byte
+	 * stack buffer. Bound both ends, and express the upper one in terms of the
+	 * buffer so it cannot drift if either size changes. */
+	if (slot < 1 || (size_t)(EElen_label * slot) > sizeof(temp))
 		return;
 	//Copy current flash contents to buffer
 	okcore_flashget_common(tptr, (unsigned long *)adr, 2048);
@@ -4981,6 +5012,15 @@ void okcore_flashset_2fa_key(uint8_t *ptr, int size, int slot)
 	uint8_t temp[2048];
 	uint8_t *tptr;
 	tptr = temp;
+	/* The write below is temp[EElen_totpkey * (slot - 1) + z] into a 2048-byte stack
+	 * buffer, so the slot IS the offset. Nothing upstream bounded it: set_slot()
+	 * takes it straight from recv_buffer[5] and, unlike wipe_slot(), never
+	 * range-checked it before calling here. slot=0 underflowed the buffer and a
+	 * large slot wrote kilobytes past it, every byte attacker-supplied, on a
+	 * part with no MMU and no stack canary. Check it where the offset is
+	 * computed, so every caller is covered rather than one of them. */
+	if (slot < 1 || (size_t)(EElen_totpkey * slot) > sizeof(temp))
+		return;
 	//Copy current flash contents to buffer
 	okcore_flashget_common(tptr, (unsigned long *)adr, 2048);
 	//Add new flash contents to buffer
@@ -5645,9 +5685,19 @@ void rsa_priv_flash(uint8_t *buffer, bool wipe)
 	else if ((buffer[6] & 0x0F) == 4)
 	{ //Expect 512 Bytes
 		keysize = 512;
+		/* The smaller key types have slack: their last chunk starts below
+		 * keysize and the 57-byte copy spills harmlessly into the unused tail of
+		 * the 512-byte rsa_private_key. At 512 there is no tail - the ninth
+		 * chunk starts at 456 and a full 57-byte copy writes index 512, one past
+		 * MAX_RSA_KEY_SIZE, putting an attacker-controlled byte into the next
+		 * global. Tightening the guard instead would have rejected that chunk
+		 * and made 4096-bit keys unloadable, so clamp the copy to what is left
+		 * and leave the offset progression (and therefore the wire protocol)
+		 * exactly as it was. */
 		if (buffer[0] != 0xBA && packet_buffer_offset <= 456)
 		{
-			memcpy(rsa_private_key + packet_buffer_offset, buffer + 7, 57);
+			int room = MAX_RSA_KEY_SIZE - packet_buffer_offset;
+			memcpy(rsa_private_key + packet_buffer_offset, buffer + 7, room < 57 ? room : 57);
 			packet_buffer_offset = packet_buffer_offset + 57;
 		}
 	}
@@ -6214,6 +6264,18 @@ void okcore_run_pending_op() {
 
 void wipetasks() {
 	packet_buffer_offset = 0;
+	/* Private key material does not survive the end of an operation.
+	 *
+	 * okcore_flashget_RSA()/okcore_flashget_ECC() decrypt a key into these two
+	 * globals and nothing cleared them afterwards - not the sign and decrypt
+	 * paths, not their error paths, and not this function. A key therefore sat
+	 * in RAM from the first use until something happened to overwrite it, which
+	 * is what made every stale-state bug in okcrypto.cpp worse than it looked:
+	 * an operation that fell through its type dispatch, or reached a slot it had
+	 * no key for, was still holding the previous slot's key. Wipe on the same
+	 * boundary everything else is wiped on. */
+	memset(rsa_private_key, 0, MAX_RSA_KEY_SIZE);
+	memset(ecc_private_key, 0, MAX_ECC_KEY_SIZE);
 	memset(ctap_buffer, 0, CTAPHID_BUFFER_SIZE);
 	memset(large_resp_buffer, 0, LARGE_RESP_BUFFER_SIZE);
 	memset(keyboard_buffer, 0, KEYBOARD_BUFFER_SIZE);
@@ -7711,8 +7773,16 @@ void process_packets(uint8_t *buffer, int len, uint8_t *blocknum)
 		packet_buffer_details[1] = buffer[5]; // SLOT
 		packet_buffer_details[2] = outputmode; // Outputmode
 	}
-	else if (packet_buffer_details[0] != buffer[4] && packet_buffer_details[1] != buffer[5])
+	else if (packet_buffer_details[0] != buffer[4] || packet_buffer_details[1] != buffer[5])
 	{
+		/* Was `&&`, so a continuation packet was rejected only when BOTH the
+		 * command and the slot differed from the first packet's. A packet that
+		 * kept the command but named a different slot was accepted and appended
+		 * to the same accumulation, while done_process_packets() went on to use
+		 * the FIRST packet's slot - so the bytes signed or decrypted could be
+		 * assembled under one slot's authorisation and attributed to another.
+		 * Either field differing means this packet does not belong to the
+		 * message in progress. */
 		return; // error, can't parse packets of different type
 	}
 	if (buffer[6] == 0xFF) //Not last packet

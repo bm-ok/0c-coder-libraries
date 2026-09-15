@@ -80,7 +80,13 @@
 
 #define DEBUG //Enable Serial Monitor
 //#define OK_ALLOW_NO_PRESS // Honour user-input mode 2 (no press) for stored/derived keys. Off in production: the write is refused and a stale 2 in EEPROM fails closed to challenge code.
-#define DEBUG_CTAP_VERBOSE //Enable verbose per-request CTAP/U2F presence-test logging (very noisy - fires on every presence test poll, floods Serial/SEREMU)
+//#define DEBUG_CTAP_VERBOSE //Enable verbose per-request CTAP/U2F presence-test logging (very noisy - fires on every presence test poll, floods Serial/SEREMU)
+//#define DEBUG_BULK_DUMPS //Hex-dump whole staged buffers (large_resp_buffer, AES in/out). Keep OFF while testing FIDO2.
+// A FIDO2 response has to reach the host inside the CTAPHID transaction; SEREMU
+// back-pressure inside that window delays it. One derived X-Wing response dumps
+// large_resp_buffer twice (1285 B) plus the AES buffer (1253 B) - roughly 15 KB
+// of hex, on top of ~560 ms of ML-KEM keygen, all before a single response frame
+// goes out. The one-line traces under plain DEBUG are cheap and stay on.
 
 #define STD_VERSION //Define for STD edition firmare, undefine for IN TRVL edition firmware
 #define OK_Color //Define for hardware with color LED

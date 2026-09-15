@@ -1302,7 +1302,7 @@ void okcrypto_aes_crypto_box (uint8_t *buffer, int len, bool open) {
 	Serial.print("Key");
 	byteprint(transit_key, 32);
 	#endif
-	#ifdef DEBUG
+	#ifdef DEBUG_BULK_DUMPS
 	Serial.print("buffer");
 	byteprint(buffer, len);
 	#endif

@@ -194,7 +194,10 @@ void store_FIDO_response (uint8_t *data, int len, uint8_t encrypt) {
 
   memmove(large_resp_buffer, data, len);
 #ifdef DEBUG
-      Serial.print ("Stored Data for FIDO Response");
+      Serial.print ("Stored Data for FIDO Response ");
+      Serial.println(large_resp_buffer_offset);
+#endif
+#ifdef DEBUG_BULK_DUMPS
 	  byteprint(large_resp_buffer, large_resp_buffer_offset);
 #endif
 	 wipedata(); //Data will wait 5 seconds to be retrieved

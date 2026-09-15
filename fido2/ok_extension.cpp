@@ -604,9 +604,11 @@ int16_t send_stored_response(uint8_t * output, uint8_t opt3) {
   int16_t ret = 0;
 	if(profilemode!=NONENCRYPTEDPROFILE) {
 		#ifdef DEBUG
-		Serial.println("Sending data on OnlyKey via Webauthn");
-		byteprint(large_resp_buffer, large_resp_buffer_offset);
+		Serial.print("Sending data on OnlyKey via Webauthn ");
 		Serial.println(large_resp_buffer_offset);
+		#endif
+		#ifdef DEBUG_BULK_DUMPS
+		byteprint(large_resp_buffer, large_resp_buffer_offset);
 		#endif
     // Check if large response is ready
 		if (pending_operation==CTAP2_ERR_OPERATION_PENDING) {

@@ -661,6 +661,10 @@ void okcrypto_decrypt (uint8_t *buffer){
 		// three attempts, and correctly read as NOT a request for input - a
 		// waiting OnlyKey pulses. The operation was in fact waiting, and timed
 		// out after 20 s having never asked for anything.
+		//
+		// NEO_Color is defined in okcore.cpp and not declared in any header;
+		// ok_extension.cpp externs it locally for the same reason.
+		extern uint8_t NEO_Color;
 		fadeon(NEO_Color);
 		return;
 	}

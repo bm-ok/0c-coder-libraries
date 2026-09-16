@@ -256,7 +256,7 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 	uint8_t browser;
 	uint8_t os;
 	uint8_t temp[256];
-	uint8_t pubsize;
+	uint8_t pubsize = 0;
 	extern uint8_t derived_key_challenge_mode;
 
 	memcpy(client_handle, keyh+OK_KEYHANDLE_HEADER_LEN, handle_len);
@@ -463,7 +463,32 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 					memmove(ecc_public_key+1, ecc_public_key, 64);
 					ecc_public_key[0] = 4;
 					pubsize=65;
-				} 
+				}
+				else {
+					// Every unhandled keytype used to fall through here with
+					// `pubsize` still UNINITIALISED - a stack byte, 0..255 -
+					// and it is a caller-supplied value that lands here:
+					// opt2 is the wire keytype plus one, so 0 (keytype 255,
+					// wrapped), 5 (keytype 4) and anything from 7 up reach
+					// this point. 1/2/3/4 are handled above and 6 (X-Wing)
+					// returns earlier.
+					//
+					// What followed was a memcpy of `pubsize` bytes to
+					// temp+53, into a 256-byte stack buffer: up to 52 bytes
+					// past its end. The DERIVE_SHAREDSEC branch then wrote 32
+					// more at temp+53+pubsize, up to 84 bytes past. And the
+					// response length is computed from the same number, so
+					// whatever the overflow left behind went back to the host.
+					// gcc says it plainly - "'pubsize' may be used
+					// uninitialized in this function" - and it is reachable
+					// from any origin webcryptcheck() lets through, which on a
+					// DEBUG build is all of them.
+					//
+					// Name the unsupported type instead.
+					ret = CTAP2_ERR_UNSUPPORTED_ALGORITHM;
+					wipedata();
+					return ret;
+				}
 
 				// Derived private key stored in ecc_private_key
 				// Derived public key stored in ecc_public_key

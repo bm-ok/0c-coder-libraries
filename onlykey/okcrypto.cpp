@@ -389,7 +389,20 @@ void okcrypto_xwing_derive_getpubkey (const uint8_t *label32, uint8_t *out) {
 	uint8_t *scratch = ctap_buffer + XWING_DERIVE_SCRATCH_OFF;
 	uint8_t *sk_M = scratch;
 	uint8_t *pk_M = scratch + MLKEM_SK_SIZE;
-	crypto_kem_keypair_derand(pk_M, sk_M, expanded);
+	/* crypto_kem_keypair_derand() is declared warn_unused_result and its return
+	 * was being dropped. It cannot fail on a well-formed buffer today, so this
+	 * changes nothing on the success path - but a silent failure here hands the
+	 * host a public key made of whatever was in scratch, and "the key is wrong
+	 * and nothing said so" is the failure mode that cost nine bugs on the
+	 * derived X-Wing path. Say it out loud instead. */
+	if (crypto_kem_keypair_derand(pk_M, sk_M, expanded) != 0) {
+		memset(seed, 0, sizeof(seed));
+		memset(expanded, 0, sizeof(expanded));
+		memset(scratch, 0, XWING_DERIVE_SCRATCH_SIZE);
+		memset(out, 0, XWING_PK_SIZE);
+		hidprint("Error ML-KEM keygen");
+		return;
+	}
 
 	memcpy(out, pk_M, MLKEM_PK_SIZE);
 	crypto_scalarmult_base(out + MLKEM_PK_SIZE, expanded + 64);   /* pk_X */
@@ -463,7 +476,7 @@ void okcrypto_getpubkey (uint8_t *buffer) {
 			else okcrypto_geteccpubkey(buffer);
 		}
 	} else if (buffer[5] == RESERVED_KEY_DERIVATION && buffer[6] <= KEYTYPE_CURVE25519) { // Generate key using provided data, return public
-	okcrypto_derive_key(buffer[6], buffer+7, NULL);
+	okcrypto_derive_key(buffer[6], buffer+7, 0);
 	send_transport_response(ecc_public_key, 64, false, false);
 	} else if (buffer[5] == RESERVED_KEY_WEB_AGENT_DERIVATION && (buffer[6] & 0x0F) == KEYTYPE_XWING) {
 		// Derived X-Wing recipient: buffer[7..39] = 32-byte label tag.
@@ -813,7 +826,6 @@ void okcrypto_getrsapubkey (uint8_t *buffer) {
 void okcrypto_rsasign (uint8_t *buffer) {
 	uint8_t rsa_signature[(type*128)];
 	uint8_t rsa_signaturetemp[64];
-	char code[6];
     if(!CRYPTO_AUTH) {
 		process_packets (buffer, 0, 0);
 		pending_operation=OKSIGN_ERR_USER_ACTION_PENDING;
@@ -989,7 +1001,6 @@ void okcrypto_ecdsa_eddsa(uint8_t *buffer)
 {
 	uint8_t ecc_signature[64];
 	uint8_t hash[64];
-	uint8_t len = 0;
 	#ifdef DEBUG
     Serial.println();
     Serial.println("OKECDSA_EDDSA SIGN MESSAGE RECEIVED");
@@ -1027,13 +1038,13 @@ void okcrypto_ecdsa_eddsa(uint8_t *buffer)
 			}
 			if (buffer[5] == 201) {
 				//Used by SSH, old version used 132, new version uses 201 for type 1
-				okcrypto_derive_key(1, large_buffer+(large_buffer_offset-32), NULL);
+				okcrypto_derive_key(1, large_buffer+(large_buffer_offset-32), 0);
 			}
 			else if (buffer[5] == 202) {
-				okcrypto_derive_key(2, large_buffer+(large_buffer_offset-32), NULL);
+				okcrypto_derive_key(2, large_buffer+(large_buffer_offset-32), 0);
 			}
 			else if (buffer[5] == 203) {
-				okcrypto_derive_key(3, large_buffer+(large_buffer_offset-32), NULL);
+				okcrypto_derive_key(3, large_buffer+(large_buffer_offset-32), 0);
 			} else if (buffer[5] == 211) {
 				okcrypto_derive_key(1, large_buffer+(large_buffer_offset-32), RESERVED_KEY_WEB_AGENT_DERIVATION);
 			}
@@ -1154,13 +1165,13 @@ void okcrypto_ecdh(uint8_t *buffer) {
 		#endif
 		if (buffer[5] > 201) {
 			if (buffer[5] == 202) {
-				okcrypto_derive_key(2, large_buffer+(large_buffer_offset-32), NULL);
+				okcrypto_derive_key(2, large_buffer+(large_buffer_offset-32), 0);
 			}
 			else if (buffer[5] == 203) {
-				okcrypto_derive_key(3, large_buffer+(large_buffer_offset-32), NULL);
+				okcrypto_derive_key(3, large_buffer+(large_buffer_offset-32), 0);
 			} 
 			else if (buffer[5] == 204) {
-				okcrypto_derive_key(4, large_buffer+(large_buffer_offset-32), NULL); 
+				okcrypto_derive_key(4, large_buffer+(large_buffer_offset-32), 0); 
 			} else if (buffer[5] == 212) {
 				okcrypto_derive_key(2, large_buffer+(large_buffer_offset-32), RESERVED_KEY_WEB_AGENT_DERIVATION);
 			}
@@ -1264,7 +1275,7 @@ void okcrypto_hmacsha1 () {
 			for(int i=0; i<32; i++) {
 				temp[i] = i + slot;
 			}
-			okcrypto_derive_key(0, temp, NULL);
+			okcrypto_derive_key(0, temp, 0);
 		}
 		outputmode=KEYBOARD_USB;
 		// Variable buffer size
@@ -1852,7 +1863,7 @@ void okcrypto_hkdf(const void *salt, const void *inputKey, void *outputKey, cons
 	uint8_t rpid[255] ={0};
 	extern uint8_t ctap_buffer[CTAPHID_BUFFER_SIZE];
 	uint8_t *ptr = ctap_buffer+4;
-	while (*ptr != 0x02 && i<sizeof(rpid)) {
+	while (*ptr != 0x02 && i < (int)sizeof(rpid)) {
 		rpid[i] = *ptr;
 		i++;
 		ptr++;
@@ -2507,7 +2518,18 @@ void okcrypto_mlkem_getpubkey (uint8_t *buffer) {
 
 	uint8_t *sk = ctap_buffer;
 	uint8_t *pk = ctap_buffer + MLKEM_SK_SIZE;
-	crypto_kem_keypair_derand(pk, sk, coins);
+	/* crypto_kem_keypair_derand() is declared warn_unused_result and its return
+	 * was being dropped. It cannot fail on a well-formed buffer today, so this
+	 * changes nothing on the success path - but a silent failure here hands the
+	 * host a public key made of whatever was in scratch, and "the key is wrong
+	 * and nothing said so" is the failure mode that cost nine bugs on the
+	 * derived X-Wing path. Say it out loud instead. */
+	if (crypto_kem_keypair_derand(pk, sk, coins) != 0) {
+		memset(coins, 0, 64);
+		memset(ctap_buffer, 0, MLKEM_SK_SIZE + MLKEM_PK_SIZE);
+		hidprint("Error ML-KEM keygen");
+		return;
+	}
 	memset(coins, 0, 64);
 
 	send_transport_response(pk, MLKEM_PK_SIZE, true, true);
@@ -2685,7 +2707,18 @@ void okcrypto_xwing_getpubkey (uint8_t *buffer) {
 
 	uint8_t *sk_M = ctap_buffer;
 	uint8_t *pk_M = ctap_buffer + MLKEM_SK_SIZE;
-	crypto_kem_keypair_derand(pk_M, sk_M, expanded);
+	/* crypto_kem_keypair_derand() is declared warn_unused_result and its return
+	 * was being dropped. It cannot fail on a well-formed buffer today, so this
+	 * changes nothing on the success path - but a silent failure here hands the
+	 * host a public key made of whatever was in scratch, and "the key is wrong
+	 * and nothing said so" is the failure mode that cost nine bugs on the
+	 * derived X-Wing path. Say it out loud instead. */
+	if (crypto_kem_keypair_derand(pk_M, sk_M, expanded) != 0) {
+		memset(expanded, 0, 96);
+		memset(ctap_buffer, 0, MLKEM_SK_SIZE + XWING_PK_SIZE);
+		hidprint("Error ML-KEM keygen");
+		return;
+	}
 
 	uint8_t pk_X[32];
 	crypto_scalarmult_base(pk_X, expanded + 64);

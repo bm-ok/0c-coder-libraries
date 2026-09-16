@@ -81,7 +81,7 @@ int16_t bridge_u2f_to_extensions(uint8_t * _chal, uint8_t * _appid, uint8_t klen
     ret = bridge_u2f_to_solo(_appid, sig, keyh, klen);
 
     // Using for OnlyKey
-    if ((output_buffer_size+1)<=sizeof(sig)) {
+    if ((output_buffer_size+1)<=(int)sizeof(sig)) {
         if ((output_buffer_size+1)>63) memset(sig+output_buffer_size+1, 0, sizeof(sig)-(output_buffer_size+1));
         u2f_response_writeback(sig,output_buffer_size);
     } 

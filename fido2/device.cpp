@@ -91,7 +91,6 @@ int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
     int appid_match1;
 	int appid_match2;
     extern uint8_t ctap_buffer[CTAPHID_BUFFER_SIZE];
-    extern uint8_t derived_key_challenge_mode;
     memcpy(rpid, ctap_buffer+4, 12); 
     // Read the policy byte from EEPROM rather than trusting any RAM copy. The
     // RAM copies of the mode bytes are unconditionally zeroed by wipetasks()
@@ -417,7 +416,6 @@ int ctap_user_presence_test(uint32_t wait)
     int ret = 0;
     uint32_t t1 = millis();
     uint8_t blink = 0;
-    extern uint8_t isfade;
     extern int Profile_Offset;
 
     if (_up_disabled)
@@ -546,7 +544,7 @@ int ctap_generate_rng(uint8_t * dst, size_t num)
 void ctap_reset_rk(void)
 {
     printf1(TAG_GREEN, "ctap_reset_rk");
-    ctap_flash(NULL, NULL, NULL, 5);
+    ctap_flash(0, NULL, 0, 5);
 }
 
 uint32_t ctap_rk_size(void)

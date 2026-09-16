@@ -6442,7 +6442,7 @@ void rainbowCycle()
 int calibratecaptouch(uint16_t j)
 {
 	rngloop();
-	if (onlykeyhw==OK_HW_DUO || ((touchread1 + touchread4 + touchread5) * 1.0) / ((touchread2 + touchread3 + touchread6) * 1.0) > .6 && ((touchread1 + touchread4 + touchread5) * 1.0) / ((touchread2 + touchread3 + touchread6) * 1.0) < 1.6)
+	if (onlykeyhw==OK_HW_DUO || (((touchread1 + touchread4 + touchread5) * 1.0) / ((touchread2 + touchread3 + touchread6) * 1.0) > .6 && ((touchread1 + touchread4 + touchread5) * 1.0) / ((touchread2 + touchread3 + touchread6) * 1.0) < 1.6))
 	{
 		if (j >= 200)
 		{
@@ -7211,7 +7211,6 @@ void backup()
 		delay((TYPESPEED[0] * TYPESPEED[0] / 3) * 8);
 		Keyboard.releaseAll();
 		delay((TYPESPEED[0] * TYPESPEED[0] / 3) * 8);
-		int crc = yubikey_crc16 (temp, 20);
 		if ((large_buffer_offset - i) < 57)
 		{
 			sha256_init(&bhash);
@@ -8132,7 +8131,7 @@ void process_setreport()
 					uint8_t publen = 16; // Max public size
 					memset(recv_buffer+7, 0, sizeof(recv_buffer)-7);
 					memmove(recv_buffer+7, keyboard_buffer, publen); //Public
-					for (publen; publen > 1; publen--) { // Public ID 2-16 bytes
+					for (; publen > 1; publen--) { // Public ID 2-16 bytes
 						if (recv_buffer[7+publen-1] != 0) {
 							break;
 						}
@@ -8368,7 +8367,7 @@ void fw_version_changes() {
 		set_private(recv_buffer); //set RESERVED_KEY_WEB_AGENT_DERIVATION slot 128
 		memset(recv_buffer, 0, sizeof(recv_buffer));
 		// Also wipe FIDO2 resident keys as these are now stored in new location
-		ctap_flash(NULL, NULL, NULL, 5);
+		ctap_flash(0, NULL, 0, 5);
 	}
 
 }

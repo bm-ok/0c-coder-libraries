@@ -171,7 +171,9 @@ extern int large_buffer_len;
 extern uint8_t profilekey[32];
 extern uint8_t packet_buffer_details[5];
 extern uint8_t* large_resp_buffer;
-extern uint8_t outputmode;
+extern int outputmode;   /* defined as int in okcore.cpp - the uint8_t
+                          * declaration here was UB that only worked by
+                          * little-endian luck. */
 extern uint8_t pending_operation;
 extern uint8_t transit_key[32];
 
@@ -349,20 +351,30 @@ void okcrypto_xwing_derive_seed (const uint8_t *label32, uint8_t *seed_out) {
  * request bytes ARE ctap_buffer. Scratching at the base wrote 3584 bytes over
  * that live request and then zeroed them, so the assertion the browser got back
  * was built on a wiped buffer. Symptom: the derive call rejected with
- * NotAllowedError while a plain OKCONNECT over the identical path succeeded,
- * and no error printed on either side because nothing in the chain treats a
- * clobbered request as a failure.
+ * NotAllowedError while a plain OKCONNECT over the identical path succeeded.
  *
- * So the derived path scratches in the TAIL instead, above anything a request
- * that reaches it can occupy. The bound is not a guess: bridge_to_onlykey()
- * copies the keyhandle into a 256-byte local (ok_extension.cpp) and the rest of
- * such a getAssertion is the rpId, clientDataHash and CBOR framing - low
- * hundreds of bytes against the 3001 left below the scratch. The static assert
- * keeps that true if either size moves. */
+ * The first attempt at a fix moved the scratch to the TAIL of ctap_buffer, and
+ * that was worse. large_buffer IS the tail - ctap_buffer[5465,6585) - and it is
+ * where okcrypto_decrypt() stages the ciphertext it hands to
+ * okcrypto_xwing_derive_decaps() as `ct`. pk_M landed at [5401,6585), covering
+ * the whole of it, so crypto_kem_keypair_derand() overwrote the ciphertext
+ * before crypto_kem_dec() read it. ML-KEM's implicit rejection meant the
+ * decapsulation still reported success and returned a deterministic value with
+ * nothing to do with the sender's ciphertext: every derived-key file would have
+ * failed to decrypt, with no error anywhere. Found by review, not on hardware -
+ * the hardware pass ran on the build before the move.
+ *
+ * So the scratch goes BETWEEN the two: above whatever an inbound CTAP request
+ * occupies, entirely below large_buffer. Both edges are asserted, because the
+ * whole history of this constant is one edge being fixed by breaking the other.
+ */
 #define XWING_DERIVE_SCRATCH_SIZE  (MLKEM_SK_SIZE + MLKEM_PK_SIZE)   /* 3584 */
-#define XWING_DERIVE_SCRATCH_OFF   (CTAPHID_BUFFER_SIZE - XWING_DERIVE_SCRATCH_SIZE)
-static_assert(XWING_DERIVE_SCRATCH_OFF >= 2048,
-	"ctap_buffer tail scratch would collide with an in-flight CTAP request");
+#define XWING_DERIVE_SCRATCH_OFF   (CTAPHID_BUFFER_SIZE - LARGE_BUFFER_SIZE - XWING_DERIVE_SCRATCH_SIZE)
+static_assert(XWING_DERIVE_SCRATCH_OFF >= 1024,
+	"ctap_buffer scratch would collide with an in-flight CTAP request");
+static_assert(XWING_DERIVE_SCRATCH_OFF + XWING_DERIVE_SCRATCH_SIZE
+	              <= CTAPHID_BUFFER_SIZE - LARGE_BUFFER_SIZE,
+	"ctap_buffer scratch would overlap large_buffer - the staged ciphertext");
 
 /* Derived recipient. out must be XWING_PK_SIZE (1216) bytes.
  * Same expansion and layout as okcrypto_xwing_getpubkey(). */
@@ -428,7 +440,22 @@ void okcrypto_getpubkey (uint8_t *buffer) {
 	Serial.println("OKGETPUBKEY MESSAGE RECEIVED");
 	#endif
 	if (buffer[5] < 5 && !buffer[6]) { //Slot 101-132 are for ECC, 1-4 are for RSA
-		if (okcore_flashget_RSA ((int)buffer[5])) okcrypto_getrsapubkey(buffer);
+		if (okcore_flashget_RSA ((int)buffer[5])) {
+			/* okcrypto_getrsapubkey() sends (type * 128) bytes out of
+			 * rsa_publicN[MAX_RSA_KEY_SIZE=512]. For a composite PQC PGP slot
+			 * type is 7, so it sent 896 bytes: 384 past the array, straight to
+			 * the host, and send_transport_response() then memset()s the same
+			 * 896 bytes - 384 of them past the end. okcore_flashget_RSA() never
+			 * populates rsa_publicN for this type (it decrypts the 160-byte seed
+			 * blob into rsa_private_key and returns), so there was no public key
+			 * there to send in the first place. A composite key's public halves
+			 * come from okpqc_getpubkey(), not from an RSA modulus. */
+			if ((type & 0x0F) == KEYTYPE_PQC_PGP) {
+				hidprint("Error use OKGETPUBKEY PQC for composite keys");
+			} else {
+				okcrypto_getrsapubkey(buffer);
+			}
+		}
 	} else if (buffer[5] < 117) { //128-132 are reserved
 		if (okcore_flashget_ECC ((int)buffer[5])) {
 			if (type == KEYTYPE_MLKEM768) okcrypto_mlkem_getpubkey(buffer);
@@ -555,15 +582,6 @@ void okcrypto_decrypt (uint8_t *buffer){
 				return;
 			}
 			derive_pending = 0;
-			#ifdef DEBUG
-			Serial.print("DECAP-AT-CONFIRM label ");
-			for (int d = 0; d < 4; d++) { Serial.print(derive_label[d]); Serial.print(","); }
-			Serial.print(" ct ");
-			for (int d = 0; d < 4; d++) { Serial.print(large_buffer[d]); Serial.print(","); }
-			Serial.print("|");
-			for (int d = XWING_CT_SIZE - 4; d < XWING_CT_SIZE; d++) { Serial.print(large_buffer[d]); Serial.print(","); }
-			Serial.println();
-			#endif
 			uint8_t ss[XWING_SS_SIZE];
 			if (okcrypto_xwing_derive_decaps(derive_label, large_buffer, ss) != 0) {
 				hidprint("Error X-Wing derived decaps failed");
@@ -587,6 +605,23 @@ void okcrypto_decrypt (uint8_t *buffer){
 
 		const int derive_total = 32 + XWING_CT_SIZE;
 		int n = (buffer[6] == 0xFF) ? 57 : buffer[6];
+
+		/* buffer is recv_buffer[64], so a report carries at most 57 payload
+		 * bytes. buffer[6] is a length from the wire and only 0xFF was special-
+		 * cased, so 58..254 passed straight through and the copy below read
+		 * buffer[7 + i] well past the 64-byte packet into neighbouring globals,
+		 * folding them into the ciphertext. (`n < 0` below never fired - n comes
+		 * from a uint8_t.)
+		 *
+		 * This has to be checked BEFORE the padding tolerance underneath, which
+		 * exists to forgive a tail a few bytes longer than the payload: an
+		 * out-of-range length must be refused, not quietly clamped into range. */
+		if (buffer[6] != 0xFF && buffer[6] > 57) {
+			okcrypto_derive_reset();
+			hidprint("Error derived decaps chunk size");
+			fadeoff(0);
+			return;
+		}
 
 		// The FINAL report's length is the keyhandle's data length, and
 		// encode_ctaphid_request_as_keyhandle() zero-pads every keyhandle up to
@@ -640,15 +675,6 @@ void okcrypto_decrypt (uint8_t *buffer){
 		}
 		derive_offset = 0;
 		derive_pending = 1;
-		#ifdef DEBUG
-		Serial.print("DECAP-AT-PRIME label ");
-		for (int d = 0; d < 4; d++) { Serial.print(derive_label[d]); Serial.print(","); }
-		Serial.print(" ct ");
-		for (int d = 0; d < 4; d++) { Serial.print(large_buffer[d]); Serial.print(","); }
-		Serial.print("|");
-		for (int d = XWING_CT_SIZE - 4; d < XWING_CT_SIZE; d++) { Serial.print(large_buffer[d]); Serial.print(","); }
-		Serial.println();
-		#endif
 
 		// Prime the confirmation over the whole reassembled request. Two
 		// updates rather than one concatenated buffer: there is no 1152-byte
@@ -986,6 +1012,19 @@ void okcrypto_ecdsa_eddsa(uint8_t *buffer)
 		uint8_t tmp[32 + 32 + 64];
 		SHA256_HashContext ectx = {{&init_SHA256, &update_SHA256, &finish_SHA256, 64, 32, tmp}};
 		if (buffer[5] > 200) {
+			/* 201/202/203 (SSH/GPG) and 211/212/213 (web-and-agent domain) are
+			 * the whole set. okcrypto_sign() routes 201..204 here, so 204 -
+			 * which names no key type - fell through this chain with `type` and
+			 * ecc_private_key left over from whatever ran last, and then signed
+			 * with them, or (for a stale type outside 1..3) returned the
+			 * uninitialised ecc_signature[64] as if it were a signature.
+			 * Reject it rather than letting stale state decide. */
+			if (buffer[5] != 201 && buffer[5] != 202 && buffer[5] != 203 &&
+			    buffer[5] != 211 && buffer[5] != 212 && buffer[5] != 213) {
+				hidprint("Error invalid derived key slot");
+				fadeoff(0);
+				return;
+			}
 			if (buffer[5] == 201) {
 				//Used by SSH, old version used 132, new version uses 201 for type 1
 				okcrypto_derive_key(1, large_buffer+(large_buffer_offset-32), NULL);
@@ -1032,6 +1071,14 @@ void okcrypto_ecdsa_eddsa(uint8_t *buffer)
 	  	byteprint(ecc_private_key, sizeof(ecc_private_key));
 		#endif
 		pending_operation=CTAP2_ERR_OPERATION_PENDING;			
+		/* The chain below has no else: a `type` outside 1..3 signed nothing and
+		 * the uninitialised ecc_signature[64] went to the host as the result -
+		 * 64 bytes of whatever that stack frame last held. Fail instead. */
+		if (type != 0x01 && type != 0x02 && type != 0x03) {
+			hidprint("Error key not set as signature key");
+			fadeoff(0);
+			return;
+		}
 		if (type==0x01) Ed25519::sign(ecc_signature, ecc_private_key, ecc_public_key, large_buffer, large_buffer_offset);
 		else if (type==0x02) {
 			const struct uECC_Curve_t * curve = uECC_secp256r1(); //P-256

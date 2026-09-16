@@ -477,7 +477,7 @@ void okcrypto_getpubkey (uint8_t *buffer) {
 		//
 		// 1216 bytes fits both transports: raw HID chunks at 64
 		// (send_transport_response), and WebAuthn stages into large_resp_buffer
-		// (3328) for chunked retrieval by send_stored_response() - the path
+		// (LARGE_RESP_BUFFER_SIZE) for chunked retrieval by send_stored_response() - the path
 		// already carrying a 3309-byte ML-DSA-65 signature.
 		okcrypto_xwing_derive_getpubkey(buffer + 7, large_resp_buffer);
 		send_transport_response(large_resp_buffer, XWING_PK_SIZE, true, true);

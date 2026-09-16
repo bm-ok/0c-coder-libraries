@@ -1396,34 +1396,171 @@ void crypto_sha512_final(uint8_t * hash) {
 	mbedtls_md_free (&sha512_ctx);
 }
 
-void okcrypto_aes_crypto_box (uint8_t *buffer, int len, bool open) {
-	uint8_t iv[12];
-	memset(iv, 0, 12);
-	//msgcount++;
-	//int ctr = ((msgcount>>24)&0xff) | // move byte 3 to byte 0
-	//  ((msgcount<<8)&0xff0000) | // move byte 1 to byte 2
-	//  ((msgcount>>8)&0xff00) | // move byte 2 to byte 1
-	//  ((msgcount<<24)&0xff000000); // byte 0 to byte 3
-	//memcpy(iv, &ctr, 4);
-	#ifdef DEBUG
-	Serial.print("IV");
-	byteprint(iv, 12);
-	#endif
-	#ifdef DEBUG
-	Serial.print("Key");
-	byteprint(transit_key, 32);
-	#endif
-	#ifdef DEBUG_BULK_DUMPS
-	Serial.print("buffer");
-	byteprint(buffer, len);
-	#endif
-	if (open) {
-		okcrypto_aes_gcm_decrypt2 (buffer, iv, transit_key, len, false);
-	}
-	else {
-		okcrypto_aes_gcm_encrypt2 (buffer, iv, transit_key, len, false);
-	}
+/* ---- FIDO2 transit encryption, v2 --------------------------------------
+ *
+ * The transit key is a fresh ECDH secret per OKCONNECT, which is why a fixed
+ * IV looked defensible. It is not: many messages ride each key. Every chunk of
+ * a multi-part request is a separate GCM operation on the host side, and every
+ * response is another - all under one key and, until now, one all-zero IV. Same
+ * key and same IV means the same keystream, so any two messages in a session
+ * XOR to the XOR of their plaintexts.
+ *
+ * That was directly exploitable rather than merely untidy. A plain OKCONNECT
+ * answers with the status string "UNLOCKEDv<version>" in the clear (opt3 is 0
+ * on that request, so store_FIDO_response() does not encrypt it), and the very
+ * next OKCONNECT - the derive one - encrypts that same string at a known
+ * offset under the session key. XOR the two and the leading keystream for the
+ * session falls out; every other message starts at keystream offset zero, so
+ * the head of each one follows, and a derived X-Wing shared secret is only 32
+ * bytes. `tagLength: 0` on the host meant there was no authentication either,
+ * so the same keystream let an attacker flip bits undetected.
+ *
+ * GCM's requirement is that (key, IV) never repeats - NOT that a key encrypt
+ * only one message. A counter gives that directly, without restructuring the
+ * chunking:
+ *
+ *     IV = [dir(1)][counter big-endian(4)][zero(7)]
+ *
+ * The direction byte matters. With one shared counter, or two counters both
+ * starting at zero, the first request and the first response collide on the
+ * same IV under the same key - the original bug, just rarer. dir 0 is
+ * device->host and dir 1 is host->device, so the two directions can never meet.
+ *
+ * THE COUNTER TRAVELS ON THE WIRE, in the clear, ahead of the ciphertext:
+ *
+ *     [counter big-endian(4)][ciphertext(n)][tag(16)]
+ *
+ * so neither side has to track what the other has sent. That is not a
+ * refinement, it is the only version of this that survives contact with this
+ * transport:
+ *
+ *   - Windows 10 1903 delivers every FIDO2 request twice. The duplicate is
+ *     recognised and dropped further down (opt3 <= last_request_opt3), but the
+ *     decrypt happens first, so a receiver-side counter would advance twice for
+ *     one host-side increment and every message after it would fail its tag.
+ *   - A derive request is itself an OKCONNECT and replaces the transit key
+ *     mid-session. The host has already had one bug from holding a stale
+ *     sharedsec across exactly that rekey; a stale counter would be the same
+ *     bug with a worse failure mode.
+ *
+ * The counter is not covered by any AAD and does not need to be: GCM derives
+ * its whole tag computation from the IV, so a flipped counter fails the tag.
+ *
+ * Counters still restart whenever the transit key does - okcrypto_transit_reset()
+ * is called wherever the key is established - so a session never gets near
+ * 2^32 messages and the value stays small enough to read in a trace.
+ *
+ * Compatibility: this is a clean break, gated on the firmware version. The
+ * plain OKCONNECT response is unencrypted, so a host reads the version out of
+ * it before any of this applies and picks the scheme from there. Old firmware
+ * with a new host keeps working. A NEW firmware with an OLD host does not -
+ * the old host sends no counter and no tag, and every request fails to
+ * authenticate.
+ */
+static uint32_t transit_ctr_out = 0;   /* device -> host */
+
+void okcrypto_transit_reset (void) {
+	transit_ctr_out = 0;
 }
+
+static void okcrypto_transit_iv (uint8_t *iv, uint8_t dir, uint32_t ctr) {
+	memset(iv, 0, 12);
+	iv[0] = dir;
+	iv[1] = (uint8_t)(ctr >> 24);
+	iv[2] = (uint8_t)(ctr >> 16);
+	iv[3] = (uint8_t)(ctr >> 8);
+	iv[4] = (uint8_t)(ctr);
+}
+
+/* Seal a frame in place.
+ *
+ * `frame` points at the 4-byte counter field, which this writes; the plaintext
+ * must already be sitting at frame + OKCRYPTO_TRANSIT_CTR_LEN and be `len`
+ * bytes long. The caller owns len + OKCRYPTO_TRANSIT_OVERHEAD bytes at
+ * `frame`. Returns the framed length. */
+int okcrypto_transit_seal (uint8_t *frame, int len) {
+	#ifdef STD_VERSION
+	uint8_t iv[12];
+	uint32_t ctr = transit_ctr_out++;
+	uint8_t *ct = frame + OKCRYPTO_TRANSIT_CTR_LEN;
+	GCM<AES256> gcm;
+	frame[0] = (uint8_t)(ctr >> 24);
+	frame[1] = (uint8_t)(ctr >> 16);
+	frame[2] = (uint8_t)(ctr >> 8);
+	frame[3] = (uint8_t)(ctr);
+	okcrypto_transit_iv(iv, OKCRYPTO_TRANSIT_DIR_OUT, ctr);
+	gcm.clear();
+	gcm.setKey(transit_key, 32);
+	gcm.setIV(iv, 12);
+	gcm.encrypt(ct, ct, len);
+	gcm.computeTag(ct + len, OKCRYPTO_TRANSIT_TAG_LEN);
+	#ifdef DEBUG
+	Serial.print("transit seal ctr=");
+	Serial.print(ctr);
+	Serial.print(" len=");
+	Serial.println(len);
+	#endif
+	return len + OKCRYPTO_TRANSIT_OVERHEAD;
+	#else
+	return len;
+	#endif
+}
+
+/* Open a frame in place.
+ *
+ * `frame` is [counter(4)][ciphertext(n)][tag(16)] and `len` is the whole of
+ * that. On success the plaintext is moved down to frame[0] - so callers keep
+ * indexing from the start of their buffer as they always have - and its length
+ * is returned. On failure returns -1 and the buffer is wiped.
+ *
+ * A failure means these bytes were not produced by something holding the
+ * transit key. There is no partial acceptance: the caller discards the whole
+ * request rather than acting on any of it. */
+int okcrypto_transit_open (uint8_t *frame, int len) {
+	#ifdef STD_VERSION
+	uint8_t iv[12];
+	uint8_t tag[OKCRYPTO_TRANSIT_TAG_LEN];
+	uint8_t *ct = frame + OKCRYPTO_TRANSIT_CTR_LEN;
+	uint32_t ctr;
+	GCM<AES256> gcm;
+	int ptlen = len - OKCRYPTO_TRANSIT_OVERHEAD;
+	if (ptlen < 0) {
+		memset(frame, 0, len > 0 ? len : 0);
+		return -1;
+	}
+	ctr = ((uint32_t)frame[0] << 24) | ((uint32_t)frame[1] << 16) |
+	      ((uint32_t)frame[2] << 8)  |  (uint32_t)frame[3];
+	memcpy(tag, ct + ptlen, OKCRYPTO_TRANSIT_TAG_LEN);
+	okcrypto_transit_iv(iv, OKCRYPTO_TRANSIT_DIR_IN, ctr);
+	gcm.clear();
+	gcm.setKey(transit_key, 32);
+	gcm.setIV(iv, 12);
+	gcm.decrypt(ct, ct, ptlen);
+	if (!gcm.checkTag(tag, OKCRYPTO_TRANSIT_TAG_LEN)) {
+		/* Wipe rather than leave a plausible-looking plaintext behind. */
+		memset(frame, 0, len);
+		return -1;
+	}
+	memmove(frame, ct, ptlen);
+	memset(frame + ptlen, 0, len - ptlen);
+	#ifdef DEBUG
+	Serial.print("transit open ctr=");
+	Serial.print(ctr);
+	Serial.print(" len=");
+	Serial.println(ptlen);
+	#endif
+	return ptlen;
+	#else
+	return len;
+	#endif
+}
+
+/* okcrypto_aes_crypto_box() lived here. It was AES-GCM under the transit key
+ * with a hardcoded all-zero IV and the tag check commented out - a raw
+ * keystream XOR, reused for every message of a session in both directions. It
+ * is gone rather than deprecated: leaving a working same-IV primitive next to
+ * the sealed one is an invitation to call the wrong one. Use
+ * okcrypto_transit_seal() and okcrypto_transit_open() above. */
 
 int rsa_sign (int mlen, const uint8_t *msg, uint8_t *out)
 {

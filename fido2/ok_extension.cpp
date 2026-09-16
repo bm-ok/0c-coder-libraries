@@ -317,6 +317,13 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 			sha256_init(&context);
 			sha256_update(&context, transit_key, 32);
 			sha256_final(&context, transit_key);
+			// New key, new counter space. The IV is [dir][counter] and the
+			// counter is only unique relative to the key it is used with, so
+			// the two have to be replaced together. This matters more than it
+			// looks: a derive request is ITSELF an OKCONNECT, so the key is
+			// rolled mid-session, every session, and a counter carried across
+			// that boundary would start reusing IVs under the new key.
+			okcrypto_transit_reset();
 			#ifdef DEBUG
 			Serial.println("Transit AES Key = ");
 			byteprint(transit_key, 32);
@@ -533,7 +540,49 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 			}
 		} else if (wc_level) {  // Protected mode, only allow crp.to and localhost
 			//Todo add localhost support
-			okcrypto_aes_crypto_box (client_handle, handle_len, true);
+			// Transit v2: [counter(4)][ciphertext][tag(16)], verified before a
+			// single byte of it is looked at. This used to be
+			// okcrypto_aes_crypto_box(..., true) - AES-GCM with an all-zero IV
+			// and the tag check commented out, which is to say a raw keystream
+			// XOR with no authentication at all. Every chunk of every request
+			// in a session was encrypted under the same key and the same IV,
+			// and nothing downstream could tell a tampered chunk from a real
+			// one.
+			//
+			// handle_len becomes the PLAINTEXT length, and the plaintext is
+			// moved to the front of client_handle, so the 57-byte packet loop
+			// below is unchanged.
+			{
+				int ptlen = okcrypto_transit_open(client_handle, handle_len);
+				if (ptlen < 0) {
+					// Not from something holding the transit key. Do not
+					// dispatch any part of it - not the command, not the slot,
+					// not one chunk.
+					//
+					// Staging an error is conditional, because the obvious
+					// version of it destroys a result the user already earned.
+					// Windows 10 1903 sends every FIDO2 request twice, and the
+					// duplicate of a DERIVE_SHARED_SECRET arrives here rather
+					// than in the OKCONNECT branch above - `cmd == OKCONNECT &&
+					// !CRYPTO_AUTH` is false the second time, because the first
+					// copy set CRYPTO_AUTH while it waits for the button. An
+					// OKCONNECT keyhandle is not transit-encrypted (it IS the
+					// key exchange), so it cannot authenticate, and an
+					// unconditional hidprint() here would overwrite the staged
+					// shared secret with an error string the moment the user
+					// pressed the button.
+					//
+					// So: say something only when there is nothing to lose.
+					if (!large_resp_buffer_offset && !CRYPTO_AUTH &&
+					    pending_operation != CTAP2_ERR_OPERATION_PENDING) {
+						outputmode = WEBAUTHN;
+						hidprint("Error message failed authentication");
+					}
+					ret = send_stored_response(output, opt3);
+					return ret;
+				}
+				handle_len = ptlen;
+			}
 			#ifdef DEBUG
 			Serial.println("Decrypted client handle");
 			byteprint(client_handle, handle_len);

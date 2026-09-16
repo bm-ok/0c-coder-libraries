@@ -94,7 +94,12 @@
 #define FACTORYKEYS // Attestation key and other keys encrypted using CHIP ID and RNG for unique keys per device
 #define OKversionmaj "3"
 #define OKversionmin "0"
-#define OKversionpat "4"
+/* 3.0.5 is the FIRMWARE VERSION GATE for FIDO2 transit v2 (counter IV + GCM
+ * tag; see okcrypto.cpp). The host reads this string out of the plain OKCONNECT
+ * response - which is not encrypted - and picks its framing from it, so
+ * anything below 3.0.5 keeps the legacy scheme and anything at or above it
+ * speaks v2. onlykey.extra.js has the matching constant, TRANSIT_V2_MIN. */
+#define OKversionpat "5"
 
 #ifndef OKCORE_H
 #include "okcore.h"

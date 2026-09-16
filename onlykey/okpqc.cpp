@@ -165,12 +165,12 @@ void okpqc_sign(uint8_t *buffer)
         pending_operation = CTAP2_ERR_DATA_READY;
         /* Send only rho, the first 32 bytes. The whole 1952-byte key cannot be
          * returned: store_FIDO_response() drops anything >= LARGE_RESP_BUFFER_SIZE
-         * (1024) and does so SILENTLY, so the readback staged nothing and every
+         * and, at the time, did so SILENTLY, so the readback staged nothing and every
          * poll answered "Error incorrect challenge was entered" - its
          * nothing-is-staged message - which reads as a rejected challenge.
          * rho = H(xi || k || l)[0:32] is enough to compare derivations: it
          * differs whenever the seed or the expansion differs. */
-        send_transport_response(pk, 32, false, true);
+        send_transport_response(pk, 32, true, true);
         fadeoff(85);
         return;
     }
@@ -196,7 +196,7 @@ void okpqc_sign(uint8_t *buffer)
     if (sel == PQC_HALF_PQC_SEED) {
         pending_operation = CTAP2_ERR_DATA_READY;
         memset(large_buffer, 0, LARGE_BUFFER_SIZE);
-        send_transport_response(rsa_private_key + PQC_OFF_MLDSA_SEED, 32, false, true);
+        send_transport_response(rsa_private_key + PQC_OFF_MLDSA_SEED, 32, true, true);
         fadeoff(85);
         return;
     }
@@ -207,7 +207,7 @@ void okpqc_sign(uint8_t *buffer)
         okpqc_ed25519_sign(sig, msg, msglen, rsa_private_key + PQC_OFF_ED25519);
         memset(large_buffer, 0, LARGE_BUFFER_SIZE);
         pending_operation = CTAP2_ERR_DATA_READY;
-        send_transport_response(sig, ED25519_SIG_SIZE, false, true);
+        send_transport_response(sig, ED25519_SIG_SIZE, true, true);
         memset(sig, 0, sizeof sig);
     } else {                                             /* ML-DSA-65 */
         uint8_t pk[MLDSA_PK_SIZE];
@@ -224,11 +224,29 @@ void okpqc_sign(uint8_t *buffer)
         memset(large_buffer, 0, LARGE_BUFFER_SIZE);
         if (rc != 0 || siglen != MLDSA_SIG_SIZE) { pending_operation = 0; hidprint("Error ML-DSA sign"); return; }
         pending_operation = CTAP2_ERR_DATA_READY;
-        send_transport_response(sig, MLDSA_SIG_SIZE, false, true);   /* 3309 B, fragmented by transport */
+        send_transport_response(sig, MLDSA_SIG_SIZE, true, true);   /* 3309 B + 20 B transit frame, fragmented by transport */
         memset(sig, 0, MLDSA_SIG_SIZE);
     }
     fadeoff(85);
 }
+
+/* Every response above and below now goes out with encrypt = 1.
+ *
+ * It used to be 0 on all of them, which on the raw-HID path means nothing -
+ * send_transport_response() ignores the flag there - but on the WebAuthn path
+ * means the payload crosses the FIDO2 tunnel in the clear. That included the
+ * X25519 and ML-KEM-768 shared secrets: the two values a composite decryption
+ * exists to produce. The classical half of the same feature
+ * (okcrypto.cpp, the derived X-Wing secret) has always encrypted them, so the
+ * PQC half was the odd one out rather than the rule.
+ *
+ * The ML-DSA public key and the signature are not secret, but they are
+ * authenticated now, which they were not - and a response the host can trust
+ * not to have been altered is worth more here than the few microseconds of
+ * AES saved by leaving it bare.
+ *
+ * Host side: poll_for_response() asks for the FRAMED length
+ * (transit_framed()) and the caller opens the frame. */
 
 /* ============================= DECRYPT ============================ */
 void okpqc_decrypt(uint8_t *buffer)
@@ -253,7 +271,7 @@ void okpqc_decrypt(uint8_t *buffer)
         if (rc != 0) { pending_operation = 0; hidprint("Error X25519"); return; }
         memcpy(large_resp_buffer, ss, X25519_SS_SIZE); memset(ss, 0, sizeof ss);
         pending_operation = CTAP2_ERR_DATA_READY;
-        send_transport_response(large_resp_buffer, X25519_SS_SIZE, false, true);
+        send_transport_response(large_resp_buffer, X25519_SS_SIZE, true, true);
     } else if (large_buffer_offset == MLKEM_CT_SIZE) {   /* ML-KEM-768 decapsulate 1088-B ct */
         uint8_t pk[MLKEM_PK_SIZE], ss[MLKEM_SS_SIZE];
         /* seed used DIRECTLY as coins (d||z) — no SHAKE(32->64); this is an imported key */
@@ -264,7 +282,7 @@ void okpqc_decrypt(uint8_t *buffer)
         if (rc != 0) { memset(ss, 0, sizeof ss); pending_operation = 0; hidprint("Error ML-KEM decaps"); return; }
         memcpy(large_resp_buffer, ss, MLKEM_SS_SIZE); memset(ss, 0, sizeof ss);
         pending_operation = CTAP2_ERR_DATA_READY;
-        send_transport_response(large_resp_buffer, MLKEM_SS_SIZE, false, true);
+        send_transport_response(large_resp_buffer, MLKEM_SS_SIZE, true, true);
     } else {
         hidprint("Error PQC decrypt: bad input size");
         memset(large_buffer, 0, LARGE_BUFFER_SIZE);

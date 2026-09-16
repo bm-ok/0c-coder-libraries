@@ -157,7 +157,13 @@ int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
 
 void store_FIDO_response (uint8_t *data, int len, uint8_t encrypt) {
     cancelfadeoffafter20();
-  if (len >= (int)LARGE_RESP_BUFFER_SIZE) {
+  // The counter and the tag go INTO large_resp_buffer alongside the payload, so
+  // they have to be counted before the copy, not after it. A response that fits
+  // only without its framing does not fit.
+  const int framed = (encrypt == 1 || encrypt == 2)
+                       ? len + OKCRYPTO_TRANSIT_OVERHEAD
+                       : len;
+  if (framed >= (int)LARGE_RESP_BUFFER_SIZE) {
     // Was a bare `return`. A response too large to stage then vanished with no
     // error anywhere, and the next OKPING - finding nothing staged and
     // CRYPTO_AUTH cleared by the completed operation - answered "Error
@@ -166,11 +172,36 @@ void store_FIDO_response (uint8_t *data, int len, uint8_t encrypt) {
     hidprint("Error response too large to store");
     return;
   }
-	if (encrypt==1) {
-		okcrypto_aes_crypto_box (data, len, false);
-	} else if (encrypt==2) {
-		okcrypto_aes_crypto_box (data+32, len-32, false); // Don't encrypt pubkey
-	} else {
+  if (encrypt == 2 && len < 32) {
+    // encrypt == 2 means "the first 32 bytes are the transit public key and
+    // stay in the clear". Nothing shorter than that has a public key in it, and
+    // sealing len - 32 bytes would be a negative length.
+    hidprint("Error malformed response");
+    return;
+  }
+
+  // Encryption happens AFTER the copy into large_resp_buffer, which is the
+  // reverse of what this function used to do. It cannot be done before: the
+  // framing grows the message by OKCRYPTO_TRANSIT_OVERHEAD bytes and callers
+  // hand us exactly-sized buffers - okpqc_decrypt() passes a 32-byte shared
+  // secret, okcrypto_ecdh() passes ecc_public_key - so writing a counter and a
+  // tag around the payload in the caller's buffer would run off the end of it.
+  // large_resp_buffer is the one buffer with room, so the payload moves there
+  // first and is sealed in place.
+  if (encrypt == 1) {
+    /* [counter(4)][ciphertext(len)][tag(16)] */
+    memmove(large_resp_buffer + OKCRYPTO_TRANSIT_CTR_LEN, data, len);
+    large_resp_buffer_offset = okcrypto_transit_seal(large_resp_buffer, len);
+  } else if (encrypt == 2) {
+    /* [transit pubkey(32), clear][counter(4)][ciphertext(len-32)][tag(16)]
+     *
+     * The tail moves first. `data` is often large_resp_buffer itself (the
+     * derived X-Wing recipient is built there), so moving the head down would
+     * otherwise overwrite the source of the tail. */
+    memmove(large_resp_buffer + 32 + OKCRYPTO_TRANSIT_CTR_LEN, data + 32, len - 32);
+    memmove(large_resp_buffer, data, 32);
+    large_resp_buffer_offset = 32 + okcrypto_transit_seal(large_resp_buffer + 32, len - 32);
+  } else {
     // Unencrypted message, check if it's an error message
     if (strcmp((char*)data, "Error")) {
       // `data` may BE large_resp_buffer: okpqc_decrypt() writes each half's
@@ -197,10 +228,10 @@ void store_FIDO_response (uint8_t *data, int len, uint8_t encrypt) {
       }
       CRYPTO_AUTH = 0;
     }
+    memmove(large_resp_buffer, data, len);
+    large_resp_buffer_offset = len;
   }
-  large_resp_buffer_offset = len;
 
-  memmove(large_resp_buffer, data, len);
 #ifdef DEBUG
       Serial.print ("Stored Data for FIDO Response ");
       Serial.println(large_resp_buffer_offset);

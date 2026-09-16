@@ -121,7 +121,13 @@ extern "C"
 /*************************************/
 //Global Buffer Sizes
 /*************************************/
-#define LARGE_RESP_BUFFER_SIZE         3328
+/* 3392, up from 3328. The largest staged response is an ML-DSA-65 signature at
+ * 3309 bytes, and transit framing now adds 20 (a 4-byte counter and a 16-byte
+ * tag) to everything that crosses the FIDO2 tunnel encrypted - 3329, one byte
+ * over the old size. store_FIDO_response() rejects an oversized response rather
+ * than truncating it, so this would have failed loudly rather than corrupted
+ * anything, but it would have failed. 3392 leaves 63 bytes of headroom. */
+#define LARGE_RESP_BUFFER_SIZE         3392
 #define LARGE_BUFFER_SIZE         1120
 #define PACKET_BUFFER_SIZE         1120
 #define ATTESTATION_DER_BUFFER_SIZE 768

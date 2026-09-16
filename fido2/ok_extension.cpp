@@ -87,11 +87,23 @@
 #include "extensions.h"
 #include "ok_extension.h"
 
-// Functions for use with derived key (RESERVED_KEY_WEB_DERIVATION)
+// Functions for use with derived key (RESERVED_KEY_WEB_AGENT_DERIVATION)
 #define DERIVE_PUBLIC_KEY 1
 #define DERIVE_SHAREDSEC 2
-#define DERIVE_PUBLIC_KEY_REQ_PRESS 3
-#define DERIVE_SHAREDSEC_REQ_PRESS 4
+// 3 and 4 were DERIVE_PUBLIC_KEY_REQ_PRESS / DERIVE_SHAREDSEC_REQ_PRESS.
+// Removed, and the numbers are left burned rather than reused: an old client
+// still sending them must fail loudly, not be silently reinterpreted.
+//
+// They stopped meaning what their names said. Presence is now decided by what
+// is asked for (public key: never a touch; shared secret: always one), so the
+// only thing the suffix still selected was a SECOND KEY DOMAIN, via
+// additional_data[0] = 1 in the HKDF salt - two different keys per label,
+// picked by an opcode whose name was about touches. Nothing wants that: it
+// doubles the key space for no stated purpose and it is a trap for anyone
+// reading the callers, as vault.js proves - it fetched its public key in one
+// domain and did its ECDH in the other, believing it was only choosing whether
+// a touch was required.
+#define DERIVE_OPCODE_MAX DERIVE_SHAREDSEC
 // Option to encrypt response for end-to-end data in-transit encryption
 #define NO_ENCRYPT_RESP 0
 #define ENCRYPT_RESP 1
@@ -126,6 +138,52 @@ extern uint8_t recv_buffer[64];
 extern uint8_t pending_operation;
 extern int packet_buffer_offset;
 extern uint8_t packet_buffer_details[5];
+
+// ---- Web and agent derived key user input (web_agent_derive_mode, OKSETSLOT 30) ----
+// The setting decides how the user authorises a shared-secret derive: 0 = the
+// 3-digit challenge code, 1 = button press (default), 2 = none. The key never
+// depends on it. A REQ_PRESS request variant can only RAISE the requirement to
+// a press (a page asking for presence gets it; a hostile page cannot lower the
+// setting). Challenge code = SHA-256 over the request bytes the device hashes -
+// the 32-byte label hash then the 32/64-byte ct_X / input public key - bytes
+// 0/15/31 mod 6 (mod 3 on a DUO) plus one; the web app computes and shows it.
+// Public-key derives are never gated.
+static int web_agent_derive_gate(uint8_t floor_mode, const uint8_t *data, int len)
+{
+	extern uint8_t onlykeyhw;
+	uint8_t need = okcore_web_agent_derive_mode();
+	// floor_mode is the weakest confirmation this CALL SITE will accept,
+	// independent of the user setting. It replaces the old REQ_PRESS opcode
+	// variants, which let the REQUEST raise the requirement: those opcodes are
+	// gone (one label, one key), and a per-request knob was the wrong shape
+	// anyway - a page asking politely for a prompt is not a security control.
+	//
+	// Every call site currently passes USER_INPUT_NONE, i.e. the user setting
+	// decides outright. The parameter stays because a future operation may
+	// genuinely need a floor, and because a call site that wants one should
+	// have to say so rather than inherit it.
+	if (need == USER_INPUT_NONE && floor_mode != USER_INPUT_NONE) need = floor_mode;
+	if (need == USER_INPUT_NONE) return 0;
+	int but;
+	device_set_status(CTAPHID_STATUS_UPNEEDED);
+	if (need == USER_INPUT_PRESS) {
+		but = ctap_user_presence_test(CTAP2_UP_DELAY_MS);
+	} else {
+		uint8_t h[32];
+		SHA256_CTX c;
+		sha256_init(&c);
+		sha256_update(&c, (uint8_t *)data, len);
+		sha256_final(&c, h);
+		uint8_t m = (onlykeyhw == OK_HW_DUO) ? 3 : 6;
+		but = ctap_challenge_test(CTAP2_UP_DELAY_MS, (h[0] % m) + 1, (h[15] % m) + 1, (h[31] % m) + 1);
+		memset(h, 0, 32);
+	}
+	if (but == -2) { pending_operation = 0; return CTAP2_ERR_OPERATION_DENIED; }
+	if (but > 1) return CTAP2_ERR_PROCESSING;
+	if (but < 0) return CTAP2_ERR_KEEPALIVE_CANCEL;
+	if (but == 0) { pending_operation = 0; return CTAP2_ERR_ACTION_TIMEOUT; }
+	return 0;
+}
 uint8_t transit_key[32];
 
 // Duplicate-packet suppression high-water mark for inbound OKDECRYPT/OKSIGN
@@ -156,10 +214,41 @@ uint8_t transit_key[32];
 static uint8_t last_request_opt3 = 0;
 
 
+/* Bytes of `keyh` consumed by the OnlyKey request header before the payload:
+ * cmd, opt1, opt2, opt3, then the 4-byte wallet tag and 2 more. */
+#define OK_KEYHANDLE_HEADER_LEN 10
+
 int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint8_t * output) {
     int8_t ret = 0;
 	uint8_t client_handle[256];
-	handle_len-=10;
+
+	/* handle_len is the length of an attacker-supplied WebAuthn credential id,
+	 * and it arrives here BEFORE any origin or unlock check - the webcryptcheck()
+	 * gate is 20 lines below. Unchecked, `handle_len -= 10` on a shorter id went
+	 * negative and the memcpy below took it as a size_t: an unbounded write into
+	 * a 256-byte stack frame, on a part with no MMU and no stack canary, from any
+	 * web page with no PIN and no trusted origin.
+	 *
+	 * It was reachable because the size gate and the size USED were different
+	 * numbers. ctap_get_assertion()/ctap_filter_invalid_credentials() decide a
+	 * custom credential is an extension request by calling is_extension_request()
+	 * with the CONSTANT sizeof(CredentialId) (68), which trivially clears its
+	 * `len < WALLET_MIN_LENGTH` guard, while what gets passed here as handle_len
+	 * is the real getAssertionState.customCredIdSize. A 9-byte id sails through
+	 * the first and underflows the second. (customCredIdSize is a uint8_t, so a
+	 * 256-byte id truncating to 0 underflows the same way.)
+	 *
+	 * Check the length actually being used, at the point it is used, rather than
+	 * relying on a caller's separate opinion of it. The U2F sibling path already
+	 * gates on the real key-handle length; this is the FIDO2 path catching up. */
+	if (handle_len < OK_KEYHANDLE_HEADER_LEN || handle_len > (int)sizeof(client_handle)) {
+		#ifdef DEBUG
+		Serial.print("Rejecting keyhandle of length ");
+		Serial.println(handle_len, DEC);
+		#endif
+		return 0;
+	}
+	handle_len-=OK_KEYHANDLE_HEADER_LEN;
 	uint8_t cmd = keyh[0];
 	uint8_t opt1 = keyh[1]; 
 	uint8_t opt2 = keyh[2];
@@ -170,14 +259,18 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 	uint8_t pubsize;
 	extern uint8_t derived_key_challenge_mode;
 
-	memcpy(client_handle, keyh+10, handle_len);
+	memcpy(client_handle, keyh+OK_KEYHANDLE_HEADER_LEN, handle_len);
 		
 	#ifdef DEBUG
     Serial.println("Keyhandle:");
     byteprint(client_handle, handle_len);
 	#endif
 
-    if (webcryptcheck(_appid, client_handle)) {
+    // 0 = refuse, 1 = derived keys only, 2 = also stored-slot OKDECRYPT/OKSIGN
+    // (PGP). Evaluated once: it reads an EEPROM byte and the RPID out of
+    // ctap_buffer, and calling it twice invited the two answers to disagree.
+    const int wc_level = webcryptcheck(_appid, client_handle);
+    if (wc_level) {
       	outputmode=DISCARD; // Discard output 
 		if (cmd == OKCONNECT && !CRYPTO_AUTH) {
 			large_buffer_offset = 0;
@@ -224,6 +317,13 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 			sha256_init(&context);
 			sha256_update(&context, transit_key, 32);
 			sha256_final(&context, transit_key);
+			// New key, new counter space. The IV is [dir][counter] and the
+			// counter is only unique relative to the key it is used with, so
+			// the two have to be replaced together. This matters more than it
+			// looks: a derive request is ITSELF an OKCONNECT, so the key is
+			// rolled mid-session, every session, and a counter carried across
+			// that boundary would start reusing IVs under the new key.
+			okcrypto_transit_reset();
 			#ifdef DEBUG
 			Serial.println("Transit AES Key = ");
 			byteprint(transit_key, 32);
@@ -238,101 +338,128 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 			// required making this useful for encrypted/private web pages that may
 			// be decrypted and viewed only when OnlyKey is connected and unlocked.
 			if (opt1>=DERIVE_PUBLIC_KEY) {
+				if (opt1 > DERIVE_OPCODE_MAX) {
+					// Was 3 or 4 (the removed REQ_PRESS pair), or garbage.
+					// Refuse rather than fall through: without this check an
+					// opt1 of 4 would miss every `opt1==DERIVE_SHAREDSEC` test
+					// below and be served as a PUBLIC KEY request, answering a
+					// shared-secret call with a public key and no error.
+					ret = CTAP2_ERR_EXTENSION_NOT_SUPPORTED;
+					wipedata();
+					return ret;
+				}
 				if (opt3) opt3=2; // 1=encrypt everything, 2=encrypt everything except transit public so app can derive shared secret
 				uint8_t *input_pubkey = client_handle+43+32; // Use uncompressed ecc pubkeys, could use compressed in future
+				// additional_data[0] is now always 0. It used to be 1 for the
+				// REQ_PRESS opcodes, which made them a second key domain; see
+				// the note by the opcode defines. One label, one key.
 				uint8_t additional_data[33] = {0};
-				if (opt1 == DERIVE_PUBLIC_KEY_REQ_PRESS || opt1 == DERIVE_SHAREDSEC_REQ_PRESS) {
-					additional_data[0] = 1; // Generate different key for REQ_PRESS than non REQ_PRESS
-				} else {
-					// derived_key_challenge_mode is a RAM cache of an EEPROM
-					// byte, unconditionally zeroed by wipetasks() and by every
-					// done_process_packets() call (the OnlyKey raw-HID
-					// pipeline - PIN unlock, status, OKCONNECT, SSH/GPG - a
-					// completely separate dispatch path from this FIDO2/CTAP
-					// one), and only reloaded there for slot codes >200 (an
-					// SSH/GPG-specific convention, okcrypto.cpp:207/369/650)
-					// that this FIDO2 path never sends. So the RAM copy is
-					// essentially always stale by the time this check runs,
-					// regardless of what's actually persisted in EEPROM.
-					// Reload directly here instead of trusting the cache -
-					// okeeprom_eeget_derived_key_challenge_mode() is a plain
-					// single-byte eeprom_read_byte(), no side effects.
-					okeeprom_eeget_derived_key_challenge_mode(&derived_key_challenge_mode);
-					if (!(is_bit_set(derived_key_challenge_mode, 3))) {
-						//derived keys per site without touch not enabeled
-						ret = CTAP2_ERR_EXTENSION_NOT_SUPPORTED; //APPID doesn't match
-						wipedata();
-						return ret;
-					}
-				}
+				// The touch-free opt-in (derived_key_challenge_mode bit 3) is
+				// GONE. It used to gate the non-REQ_PRESS opcodes: without it
+				// they were refused outright with
+				// CTAP2_ERR_EXTENSION_NOT_SUPPORTED. Two things were wrong with
+				// that.
+				//
+				// It did not do what its name said. "REQ_PRESS" on a PUBLIC KEY
+				// derivation never asked for a press - it only selected a
+				// different key - so a caller could always get a touch-free
+				// public-key derivation by sending opcode 3, bit 3 or no bit 3.
+				// The only real presence test was on the shared-secret variant.
+				//
+				// And it made the shipped web app depend on a non-default
+				// setting: password-generator.js passes press_required=false for
+				// BOTH calls and vault.js passes false for the public-key step,
+				// so on a factory-default key (bit 3 clear) those features were
+				// refused outright rather than prompting for a tap.
+				//
+				// Presence is now decided by WHAT is being asked for, not by
+				// which opcode the caller picked or what the user configured:
+				//
+				//   public key   - no touch. It is public data, and the caller
+				//                  cannot turn that into a secret.
+				//   shared secret - ALWAYS a touch, both opcodes, no opt-out.
+				//                  This is a decryption capability.
+				//
+				// That makes touch-free decapsulation unreachable by any
+				// setting, and incidentally fixes the password generator and the
+				// vault on default devices.
 				memcpy(additional_data+1, client_handle+43, 32); // 32 bytes of data to include in key derivation
 				opt2++;
 				memset(ecc_public_key, 0, sizeof(ecc_public_key));
 
-				// ---- X-Wing (mlkem768x25519) split custody -------------------
-				// Wire keytype 5 -> opt2==KEYTYPE_XWING(6). Returns 64 bytes,
-				// encrypted under the transit key when opt3:
-				//   DERIVE_PUBLIC_KEY -> [ pk_X(32) | mlkem_seed(32) ]
-				//   DERIVE_SHAREDSEC  -> [ ss_X(32) | mlkem_seed(32) ]
-				// sk_X (X25519) never leaves the device; the browser expands
-				// mlkem_seed and does the ML-KEM half locally.
+				// ---- X-Wing (mlkem768x25519), derived -----------------------
+				// Wire keytype 5 -> opt2 == KEYTYPE_XWING(6) (opt2++ above).
 				//
-				// Calls the SAME okcrypto_xwing_web_derive() the raw-HID path
-				// uses (okcrypto.cpp's okcrypto_getpubkey/okcrypto_decrypt,
-				// already proven correct against the CLI - TC-16/TC-17) rather
-				// than re-deriving inline, after finding live (TC-18/TC-19,
-				// browser<->CLI interop) that an earlier inline copy here
-				// produced a DIFFERENT sk_X than the CLI for the same label:
-				// okcrypto_hkdf() folds whatever RPID string is staged at
-				// ctap_buffer+4 into the derivation, and the raw-HID path
-				// explicitly stages "onlyagent.app" there
-				// (okcrypto_xwing_web_derive itself) before deriving, but this
-				// FIDO2 dispatch path never did - it derived using whatever
-				// RPID happened to already be in ctap_buffer from the
-				// surrounding CTAP2 request instead. Calling the shared
-				// function fixes that by construction and removes the
-				// duplicate-implementation drift risk entirely. This also
-				// means X-Wing derives the same key regardless of REQ_PRESS
-				// (okcrypto_xwing_web_derive has no such distinction, matching
-				// the CLI path, which never had one either) - unlike the
-				// generic EC keytypes below, whose REQ_PRESS/non-REQ_PRESS
-				// separation this doesn't touch.
+				// DERIVE_PUBLIC_KEY returns the full public recipient
+				//   [ pk_M(1184) | pk_X(32) ] = XWING_PK_SIZE
+				// staged into large_resp_buffer and retrieved in
+				// MAX_LARGE_RESP_CHUNK pieces by send_stored_response() - the
+				// same chunked path that already carries a 3309-byte ML-DSA-65
+				// composite signature. It does NOT fit in temp[256], which is
+				// why the payload is built in large_resp_buffer directly.
+				//
+				// It used to return [ pk_X(32) | mlkem_seed(32) ] and let the
+				// host expand the seed. mlkem_seed is private key material
+				// (it yields sk_M), so that handed out a private key in answer
+				// to a request for a public one. ML-KEM has no short public
+				// key - the only 32-byte value reproducing pk_M also reproduces
+				// sk_M - so the public key itself has to be what is sent.
+				//
+				// DERIVE_SHAREDSEC is NO LONGER served here. Decapsulation now
+				// needs the whole 1120-byte X-Wing ciphertext on the device
+				// (ct_M included), which does not fit this single-shot
+				// client_handle path. The browser sends it as a chunked
+				// OKDECRYPT to slot RESERVED_KEY_WEB_AGENT_DERIVATION carrying
+				// [ label32 | ct(1120) ], the same tunnel composite_decrypt
+				// already uses; okcrypto_decrypt() handles it there.
 				if (opt2 == KEYTYPE_XWING) {
-					uint8_t *xout = temp + 32 + sizeof(UNLOCKED) + 1;
 					uint8_t *label32 = client_handle + 43;
-					if (opt1 == DERIVE_SHAREDSEC || opt1 == DERIVE_SHAREDSEC_REQ_PRESS) {
-						if (opt1 == DERIVE_SHAREDSEC_REQ_PRESS) {
-							int but;
-							device_set_status(CTAPHID_STATUS_UPNEEDED);
-							but = ctap_user_presence_test(CTAP2_UP_DELAY_MS);
-							if (but > 1) return CTAP2_ERR_PROCESSING;
-							else if (but < 0) return CTAP2_ERR_KEEPALIVE_CANCEL;
-							else if (but == 0) { pending_operation = 0; return CTAP2_ERR_ACTION_TIMEOUT; }
-						}
-						// ct_X = input pubkey from the age stanza
-						uint8_t *ct_X = client_handle + 43 + 32;
-						okcrypto_xwing_web_derive(label32, ct_X, xout);
-					} else {
-						okcrypto_xwing_web_derive(label32, NULL, xout);
+					if (opt1 == DERIVE_SHAREDSEC) {
+						hidprint("Error use OKDECRYPT for derived X-Wing decapsulation");
+						ret = send_stored_response(output, opt3);
+						return ret;
 					}
-					send_transport_response(temp, 32 + sizeof(UNLOCKED) + 1 + 64, opt3, false);
+					const int hdr = 32 + sizeof(UNLOCKED) + 1;
+					memmove(large_resp_buffer, temp, hdr);   /* transit pubkey + status */
+					#ifdef DEBUG
+					Serial.print("XWING derive start ms=");
+					Serial.println(millis());
+					#endif
+					okcrypto_xwing_derive_getpubkey(label32, large_resp_buffer + hdr);
+					#ifdef DEBUG
+					Serial.print("XWING derive done ms=");
+					Serial.print(millis());
+					Serial.print(" hdr=");
+					Serial.print(hdr);
+					Serial.print(" total=");
+					Serial.println(hdr + XWING_PK_SIZE);
+					#endif
+					send_transport_response(large_resp_buffer, hdr + XWING_PK_SIZE, opt3, false);
 					ret = send_stored_response(output, opt3);
+					#ifdef DEBUG
+					Serial.print("XWING derive ret=");
+					Serial.print(ret);
+					Serial.print(" staged=");
+					Serial.print(large_resp_buffer_offset);
+					Serial.print(" cursor=");
+					Serial.println(large_resp_buffer_cursor);
+					#endif
 					return ret;
 				}
 
-				//Similar format to SSH derivation but use RESERVED_KEY_WEB_DERIVATION key
+				//Similar format to SSH derivation but use RESERVED_KEY_WEB_AGENT_DERIVATION key
 				if (opt2 == KEYTYPE_NACL || opt2 == KEYTYPE_CURVE25519) {
-					okcrypto_derive_key(KEYTYPE_CURVE25519, additional_data, RESERVED_KEY_WEB_DERIVATION); //Curve25519
+					okcrypto_derive_key(KEYTYPE_CURVE25519, additional_data, RESERVED_KEY_WEB_AGENT_DERIVATION); //Curve25519
 					pubsize=32;
 				}
 				else if (opt2 == KEYTYPE_P256R1) {
-					okcrypto_derive_key(KEYTYPE_P256R1, additional_data, RESERVED_KEY_WEB_DERIVATION);
+					okcrypto_derive_key(KEYTYPE_P256R1, additional_data, RESERVED_KEY_WEB_AGENT_DERIVATION);
 					memmove(ecc_public_key+1, ecc_public_key, 64);
 					ecc_public_key[0] = 4;
 					pubsize=65;
 				}
 				else if (opt2 == KEYTYPE_P256K1) {
-					okcrypto_derive_key(KEYTYPE_P256K1, additional_data, RESERVED_KEY_WEB_DERIVATION);
+					okcrypto_derive_key(KEYTYPE_P256K1, additional_data, RESERVED_KEY_WEB_AGENT_DERIVATION);
 					memmove(ecc_public_key+1, ecc_public_key, 64);
 					ecc_public_key[0] = 4;
 					pubsize=65;
@@ -350,7 +477,7 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 				byteprint(ecc_private_key, sizeof(ecc_private_key));
 				#endif
 
-				if (opt1==DERIVE_SHAREDSEC || opt1==DERIVE_SHAREDSEC_REQ_PRESS) { // Return DERIVE_PUBLIC_KEY and DERIVE_SHAREDSEC
+				if (opt1==DERIVE_SHAREDSEC) { // Return DERIVE_PUBLIC_KEY and DERIVE_SHAREDSEC
 					#ifdef DEBUG
 					Serial.println("Input Pubkey");
 					byteprint(input_pubkey, pubsize);
@@ -362,26 +489,32 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 						return ret;
 					}
 					else { 
-						// Generate Shared Secret
-						if (opt1==DERIVE_SHAREDSEC_REQ_PRESS) {
-							int but;
-							device_set_status(CTAPHID_STATUS_UPNEEDED);
-							but = ctap_user_presence_test(CTAP2_UP_DELAY_MS);
-							if ( but > 1 )
-							{
-								return CTAP2_ERR_PROCESSING;
-							}
-							else if (but < 0)
-							{
-								return CTAP2_ERR_KEEPALIVE_CANCEL;
-							}
-							else if (but == 0)
-							{
-								pending_operation=0;
-								return CTAP2_ERR_ACTION_TIMEOUT;
-							} else if (os == 'W') {
-								packet_buffer_details[3] = 'W';
-							}
+						// Generate Shared Secret. The user's web-derive input
+						// mode (field 30) decides this outright, including
+						// USER_INPUT_NONE: an unattended agent using an SSH key
+						// from that slot has to be able to run
+						// without a prompt, and that is the whole point of the
+						// setting. Default is a button press and no-touch is a
+						// deliberate opt-in, made in config mode.
+						//
+						// An earlier revision floored this at a press on the
+						// reasoning that a shared secret is a decryption
+						// capability. It is - but the floor made the setting a
+						// lie, and the unattended-agent case is exactly what
+						// field 30 exists for. Note the consequence plainly: with
+						// field 30 set to 2, any request from a trusted origin
+						// derives and decapsulates silently for as long as the
+						// key is unlocked. That is the bargain the setting makes,
+						// and it is why it is off by default and why it takes
+						// config mode to change.
+						//
+						// Public-key derivation is ungated regardless: it is
+						// public data and the caller cannot turn it into a
+						// secret.
+						{
+							int g = web_agent_derive_gate(USER_INPUT_NONE, client_handle + 43, 32 + pubsize);
+							if (g) return g;
+							if (os == 'W') packet_buffer_details[3] = 'W';
 						}
 						// Use ecc_private_key and provided pubkey to generate shared secret
 						if (okcrypto_shared_secret (input_pubkey, temp+32+sizeof(UNLOCKED)+1+pubsize)) { // Generate derived key shared secret in temp
@@ -405,9 +538,51 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 			} else {
 				send_transport_response (temp, 32+sizeof(UNLOCKED)+1, opt3, false); //Encrypt if opt3 and send right away
 			}
-		} else if (webcryptcheck(_appid, client_handle)>1) {  // Protected mode, only allow crp.to and localhost
+		} else if (wc_level) {  // Protected mode, only allow crp.to and localhost
 			//Todo add localhost support
-			okcrypto_aes_crypto_box (client_handle, handle_len, true);
+			// Transit v2: [counter(4)][ciphertext][tag(16)], verified before a
+			// single byte of it is looked at. This used to be
+			// okcrypto_aes_crypto_box(..., true) - AES-GCM with an all-zero IV
+			// and the tag check commented out, which is to say a raw keystream
+			// XOR with no authentication at all. Every chunk of every request
+			// in a session was encrypted under the same key and the same IV,
+			// and nothing downstream could tell a tampered chunk from a real
+			// one.
+			//
+			// handle_len becomes the PLAINTEXT length, and the plaintext is
+			// moved to the front of client_handle, so the 57-byte packet loop
+			// below is unchanged.
+			{
+				int ptlen = okcrypto_transit_open(client_handle, handle_len);
+				if (ptlen < 0) {
+					// Not from something holding the transit key. Do not
+					// dispatch any part of it - not the command, not the slot,
+					// not one chunk.
+					//
+					// Staging an error is conditional, because the obvious
+					// version of it destroys a result the user already earned.
+					// Windows 10 1903 sends every FIDO2 request twice, and the
+					// duplicate of a DERIVE_SHARED_SECRET arrives here rather
+					// than in the OKCONNECT branch above - `cmd == OKCONNECT &&
+					// !CRYPTO_AUTH` is false the second time, because the first
+					// copy set CRYPTO_AUTH while it waits for the button. An
+					// OKCONNECT keyhandle is not transit-encrypted (it IS the
+					// key exchange), so it cannot authenticate, and an
+					// unconditional hidprint() here would overwrite the staged
+					// shared secret with an error string the moment the user
+					// pressed the button.
+					//
+					// So: say something only when there is nothing to lose.
+					if (!large_resp_buffer_offset && !CRYPTO_AUTH &&
+					    pending_operation != CTAP2_ERR_OPERATION_PENDING) {
+						outputmode = WEBAUTHN;
+						hidprint("Error message failed authentication");
+					}
+					ret = send_stored_response(output, opt3);
+					return ret;
+				}
+				handle_len = ptlen;
+			}
 			#ifdef DEBUG
 			Serial.println("Decrypted client handle");
 			byteprint(client_handle, handle_len);
@@ -429,6 +604,28 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 			}
 			// Break the FIDO message into packets
 			else if (!CRYPTO_AUTH) {
+				// opt1 is the SLOT for these commands. A derived-key request
+				// (RESERVED_KEY_WEB_AGENT_DERIVATION) is allowed at level 1 - it is
+				// the derived X-Wing decapsulation path, which is chunked and
+				// so cannot use the single-shot OKCONNECT route. Anything
+				// naming a real slot is a stored-key operation (PGP and
+				// friends) and needs level 2, i.e. the user opting in with
+				// OKWC_ALLOW_STORED_KEY in field 31. Without this check,
+				// disabling PGP over FIDO2
+				// would also disable derived decapsulation, since both arrive
+				// as OKDECRYPT.
+				//
+				// OKPING is deliberately NOT gated: it is how a large response
+				// is retrieved in MAX_LARGE_RESP_CHUNK pieces, and the derived
+				// recipient is 1216 bytes, so level 1 needs it.
+				if (wc_level < 2 && opt1 != RESERVED_KEY_WEB_AGENT_DERIVATION) {
+					#ifdef DEBUG
+					Serial.println("Stored-key operations over FIDO2 are disabled");
+					#endif
+					hidprint("Error stored key use over FIDO2 not enabled");
+					ret = send_stored_response(output, opt3);
+					return ret;
+				}
 				int i=0;
 				if (!last_request_opt3) last_request_opt3 = opt3; // first packet
 				else if (opt3 <= last_request_opt3) return 0; // duplicate packet, thanks to win 10 1903 sending all FIDO2 messages twice
@@ -487,9 +684,11 @@ int16_t send_stored_response(uint8_t * output, uint8_t opt3) {
   int16_t ret = 0;
 	if(profilemode!=NONENCRYPTEDPROFILE) {
 		#ifdef DEBUG
-		Serial.println("Sending data on OnlyKey via Webauthn");
-		byteprint(large_resp_buffer, large_resp_buffer_offset);
+		Serial.print("Sending data on OnlyKey via Webauthn ");
 		Serial.println(large_resp_buffer_offset);
+		#endif
+		#ifdef DEBUG_BULK_DUMPS
+		byteprint(large_resp_buffer, large_resp_buffer_offset);
 		#endif
     // Check if large response is ready
 		if (pending_operation==CTAP2_ERR_OPERATION_PENDING) {
@@ -503,17 +702,38 @@ int16_t send_stored_response(uint8_t * output, uint8_t opt3) {
 			// ~513 B usable), so a full response may take several OKPING
 			// polls. large_resp_buffer_cursor tracks what has been delivered.
 			//
-			// opt3 <= large_resp_buffer_last_opt3 means this poll duplicates
-			// the one just answered (the Windows 10 1903 double-fire this file
-			// guards against elsewhere via packet_buffer_details[3]) - re-serve
-			// the same bytes rather than advancing, or a duplicate silently
-			// skips a chunk and corrupts the reassembled response.
-			int is_duplicate = large_resp_buffer_last_opt3 && opt3 <= large_resp_buffer_last_opt3;
+			// A non-zero opt3 that is <= large_resp_buffer_last_opt3 means this
+			// poll duplicates the one just answered (the Windows 10 1903
+			// double-fire this file guards against elsewhere via
+			// packet_buffer_details[3]) - re-serve the same bytes rather than
+			// advancing, or a duplicate silently skips a chunk and corrupts the
+			// reassembled response.
+			//
+			// opt3 == 0 carries no sequence information and must never be read
+			// as a duplicate: poll_for_response() in the web app sends OKPING
+			// with opt3 = 0, while the request that filled the buffer (e.g.
+			// DERIVE_PUBLIC_KEY) sets last_opt3 = 1. Treating those polls as
+			// duplicates re-served chunk 1 forever and the cursor never moved.
+			int is_duplicate = opt3 && large_resp_buffer_last_opt3 && opt3 <= large_resp_buffer_last_opt3;
 			int chunk_start = is_duplicate
 				? (large_resp_buffer_cursor > MAX_LARGE_RESP_CHUNK ? large_resp_buffer_cursor - MAX_LARGE_RESP_CHUNK : 0)
 				: large_resp_buffer_cursor;
 			int remaining = large_resp_buffer_offset - chunk_start;
 			int chunk_len = remaining > MAX_LARGE_RESP_CHUNK ? MAX_LARGE_RESP_CHUNK : remaining;
+			#ifdef DEBUG
+			Serial.print("chunk opt3=");
+			Serial.print(opt3);
+			Serial.print(" last=");
+			Serial.print(large_resp_buffer_last_opt3);
+			Serial.print(" dup=");
+			Serial.print(is_duplicate);
+			Serial.print(" start=");
+			Serial.print(chunk_start);
+			Serial.print(" len=");
+			Serial.print(chunk_len);
+			Serial.print(" of=");
+			Serial.println(large_resp_buffer_offset);
+			#endif
 			extension_writeback_init(output, chunk_len);
 			extension_writeback(large_resp_buffer + chunk_start, chunk_len);
 			if (!is_duplicate) {

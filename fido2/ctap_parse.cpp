@@ -938,13 +938,35 @@ uint8_t parse_credential_descriptor(CborValue * arr, CTAP_credentialDescriptor *
     {
         printf2(TAG_ERR,"Ignoring credential is incorrect length, treating as custom\n");
         cred->type = PUB_KEY_CRED_CUSTOM;
-        buflen = 256;
     	// OnlyKey required change start
-        ret = cbor_value_copy_byte_string(&val, (uint8_t*)&cred->credential.id, &buflen, NULL);
-        getAssertionState.customCredIdSize = buflen;
-        // OnlyKey required change end
+        //
+        // Copy ONCE, into the buffer that is actually 256 bytes, then mirror a
+        // bounded prefix into the descriptor.
+        //
+        // This used to do two copies and hand the FIRST one a capacity of 256
+        // for &cred->credential.id, which is a CredentialId - 68 bytes here.
+        // cbor_value_copy_byte_string() treats that argument as capacity, so it
+        // was licensed to write 188 bytes past the end of the field. It did not
+        // corrupt anything outside the enclosing struct Credential (the `user`
+        // entity that follows absorbs it, and a custom credential never reads
+        // that field), which is why it has been harmless in practice - but it
+        // was harmless by luck of the surrounding layout, not by construction,
+        // and any future reordering or shrinking of struct Credential turns it
+        // into a real overflow driven by an attacker-supplied credential id.
+        //
+        // is_extension_request() reads only the leading tag from the descriptor
+        // copy (extensions.cpp calls it with sizeof(CredentialId)), so a
+        // truncated prefix is all it ever needed.
+        static_assert(sizeof(getAssertionState.customCredId) >= sizeof(cred->credential.id),
+                      "customCredId must be able to hold a whole CredentialId prefix");
+        buflen = sizeof(getAssertionState.customCredId);
         ret = cbor_value_copy_byte_string(&val, getAssertionState.customCredId, &buflen, NULL);
         getAssertionState.customCredIdSize = buflen;
+
+        memset(&cred->credential.id, 0, sizeof(cred->credential.id));
+        memcpy(&cred->credential.id, getAssertionState.customCredId,
+               buflen < sizeof(cred->credential.id) ? buflen : sizeof(cred->credential.id));
+        // OnlyKey required change end
     }
     check_ret(ret);
 

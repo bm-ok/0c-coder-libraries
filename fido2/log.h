@@ -80,14 +80,19 @@ void set_logging_mask(uint32_t mask);
             Serial.println(__FILE__);\
             Serial.println(__LINE__);\
            } while(0) 
-#define dump_hex1(tag,data,len) do {\
-            Serial.println(tag);\
-            byteprint(data,len);\
-           } while(0) 
-
 
 //uint32_t timestamp();
+// Hex dumps are the expensive part of this logging, and they sit INSIDE the
+// CTAPHID transaction: ctap_end_get_assertion() dumps sigder (up to 512 B) and
+// ctap_request() dumps the whole CBOR response before a single response frame
+// is written. At ~3 characters per byte over SEREMU that is several KB of
+// back-pressure between the host's request and its answer. Keep the printf
+// text, drop the dumps, unless DEBUG_BULK_DUMPS is asked for (onlykey.h).
+#ifdef DEBUG_BULK_DUMPS
 #define dump_hex1(tag,data,len) byteprint(data,len)
+#else
+#define dump_hex1(tag,data,len)
+#endif
 #define timestamp()
 
 #else

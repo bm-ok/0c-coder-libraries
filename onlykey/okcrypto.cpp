@@ -171,7 +171,9 @@ extern int large_buffer_len;
 extern uint8_t profilekey[32];
 extern uint8_t packet_buffer_details[5];
 extern uint8_t* large_resp_buffer;
-extern uint8_t outputmode;
+extern int outputmode;   /* defined as int in okcore.cpp - the uint8_t
+                          * declaration here was UB that only worked by
+                          * little-endian luck. */
 extern uint8_t pending_operation;
 extern uint8_t transit_key[32];
 
@@ -231,39 +233,205 @@ void okcrypto_sign (uint8_t *buffer) {
 	}
 }
 
-// ---- Derived (label-based) X-Wing split custody over HID ----------------
-// UNTESTED — validate on hardware. Origin is pinned to "onlyagent.app" so the
-// derived key matches the web app (age derived recipients). sk_X (X25519) never
-// leaves the device; the host expands mlkem_seed and does the ML-KEM half.
-//   ct_x == NULL : out64 = [ pk_X(32) | mlkem_seed(32) ]   (recipient/getpubkey)
-//   ct_x != NULL : out64 = [ ss_X(32) | mlkem_seed(32) ]   (decaps)
-// label32 is the 32-byte derivation tag; the CLI and web app MUST use the SAME
-// 32 bytes for a given identity (the CLI uses SHA256(utf8(label))).
-void okcrypto_xwing_web_derive (uint8_t *label32, uint8_t *ct_x, uint8_t *out64) {
-	extern uint8_t ctap_buffer[CTAPHID_BUFFER_SIZE];
-	// Stage RPID where okcrypto_hkdf reads it: ctap_buffer+4 .. 0x02 terminator
-	const char rpid[] = "onlyagent.app";
-	memcpy(ctap_buffer + 4, rpid, sizeof(rpid) - 1);
-	ctap_buffer[4 + sizeof(rpid) - 1] = 0x02;
-	// additional_data = [0][label32]; flag 0 matches the web DERIVE (non REQ_PRESS)
-	uint8_t additional_data[33] = {0};
-	memcpy(additional_data + 1, label32, 32);
-	memset(ecc_public_key, 0, sizeof(ecc_public_key));
-	// sk_X -> ecc_private_key, pk_X -> ecc_public_key
-	okcrypto_derive_key(KEYTYPE_CURVE25519, additional_data, RESERVED_KEY_WEB_DERIVATION);
-	// mlkem_seed = SHA256( sk_X || tag ) : one-way, domain-separated (!= sk_X)
-	const char xwtag[] = "onlykey/xwing/mlkem768-seed/v1";
-	SHA256_CTX xc; sha256_init(&xc);
-	sha256_update(&xc, ecc_private_key, 32);
-	sha256_update(&xc, (const uint8_t*)xwtag, sizeof(xwtag) - 1);
-	sha256_final(&xc, out64 + 32);   // mlkem_seed in bytes 32..64 (before ss_X to keep sk_X)
-	if (ct_x) {
-		// ss_X = X25519(sk_X, ct_X); scalar is ecc_private_key set above
-		okcrypto_shared_secret(ct_x, out64);   // ss_X in bytes 0..32
-	} else {
-		memcpy(out64, ecc_public_key, 32);      // pk_X in bytes 0..32
+// ---- Derived (label-based) X-Wing over HID and FIDO2 --------------------
+//
+// Nothing is stored: the keypair is reproduced on demand from
+// (slot-128 web-and-agent derivation key, 32-byte label tag, origin). Origin is
+// pinned to
+// "onlyagent.app" so the CLI and the web app derive the same key; both hash the
+// label the same way (SHA256(utf8(label))).
+//
+// Construction, in two clearly separated layers:
+//
+//   1. HKDF (RFC 5869, HMAC-SHA256) turns the device secret, the label and the
+//      origin into ONE 32-byte X-Wing seed. This is the only place HKDF
+//      appears and the only OnlyKey-specific step.
+//   2. That seed goes through the X-Wing spec's own key generation -
+//      xwing_shake256(expanded, 96, seed, 32), ML-KEM d||z = expanded[0:64],
+//      sk_X = expanded[64:96] - the SAME call and layout the stored-slot path
+//      uses (okcrypto_xwing_keygen / _decaps / _getpubkey). A derived keypair
+//      is therefore a real draft-connolly-cfrg-xwing-kem keypair.
+//
+// This replaces a construction in which mlkem_seed was SHA256(sk_X || tag) -
+// the ML-KEM half a CHILD of the X25519 half - so an adversary who recovered
+// sk_X from the published pk_X obtained the ML-KEM seed, sk_M and the whole
+// shared secret, and the hybrid degraded to X25519-only security against
+// exactly the adversary ML-KEM exists to stop. The halves are now sibling
+// slices of one SHAKE-256 stream over a secret seed: neither reveals the other,
+// in either direction.
+//
+// No private key material is returned to the host on either call now:
+//
+//   derive getpubkey : out = [ pk_M(1184) | pk_X(32) ] = XWING_PK_SIZE, public
+//   derive decaps    : out = [ ss(32) ]                = X-Wing shared secret
+//
+// The RPID staging is gone too: okcrypto_hkdf() reads its info string out of
+// ctap_buffer+4, so this code used to write "onlyagent.app" there before
+// deriving - and a FIDO2 path that did NOT stage it derived a different sk_X
+// than the CLI for the same label (ok_extension.cpp:280 documents that hunt).
+// okcrypto_hkdf_expand() takes info as an argument, so the shared mutable
+// buffer is out of the derivation entirely.
+
+/* HKDF-Expand, RFC 5869 section 2.3, with an explicit info string.
+ * okcrypto_hkdf() hardwires info to SHA256(RPID) read from ctap_buffer and is
+ * deliberately left untouched: the P-256 / Curve25519 / NACL web-and-agent
+ * keytypes share it, and any change there moves keys that already exist. */
+void okcrypto_hkdf_expand (const uint8_t *prk, const uint8_t *info, size_t info_len,
+                           uint8_t *out, size_t L) {
+	SHA256 hash;
+	uint8_t T[32];
+	size_t done = 0, Tlen = 0;
+	uint8_t counter = 1;
+	while (done < L) {
+		hash.resetHMAC(prk, 32);
+		if (Tlen) hash.update(T, Tlen);       /* T(0) is empty, RFC 5869 */
+		hash.update(info, info_len);
+		hash.update(&counter, 1);
+		hash.finalizeHMAC(prk, 32, T, 32);
+		Tlen = 32;
+		size_t n = (L - done < 32) ? (L - done) : 32;
+		memcpy(out + done, T, n);
+		done += n;
+		counter++;
 	}
-	memset(additional_data, 0, sizeof(additional_data));
+	memset(T, 0, sizeof(T));
+}
+
+/* (slot-128 key, label, origin) -> one 32-byte X-Wing seed.
+ * 32 and not 64 on purpose: X-Wing's decapsulation key IS 32 bytes; the 64-byte
+ * quantity is ML-KEM's own d||z, which the spec expansion produces FROM it. */
+void okcrypto_xwing_derive_seed (const uint8_t *label32, uint8_t *seed_out) {
+	static const char RPID[] = "onlyagent.app";
+	static const char INFO[] = "onlykey/xwing/seed/v2";
+
+	uint8_t rpid_hash[32];
+	SHA256_CTX rc;
+	sha256_init(&rc);
+	sha256_update(&rc, (const uint8_t *)RPID, sizeof(RPID) - 1);
+	sha256_final(&rc, rpid_hash);
+
+	uint8_t salt[33] = {0};                        /* [flag 0][label32] */
+	memcpy(salt + 1, label32, 32);
+
+	okcore_flashget_ECC(RESERVED_KEY_WEB_AGENT_DERIVATION);   /* IKM -> ecc_private_key */
+
+	SHA256 h;                                      /* HKDF-Extract, RFC 5869 2.2 */
+	uint8_t prk[32];
+	h.resetHMAC(salt, sizeof(salt));
+	h.update(ecc_private_key, 32);
+	h.finalizeHMAC(salt, sizeof(salt), prk, 32);
+
+	uint8_t info[32 + sizeof(INFO) - 1];
+	memcpy(info, rpid_hash, 32);                   /* origin binding */
+	memcpy(info + 32, INFO, sizeof(INFO) - 1);
+	okcrypto_hkdf_expand(prk, info, sizeof(info), seed_out, 32);
+
+	#ifdef DEBUG
+	Serial.println();
+	Serial.println("X-Wing PRK");
+	byteprint(prk, 32);
+	Serial.println("X-Wing derived seed");
+	byteprint(seed_out, 32);
+	#endif
+
+	memset(prk, 0, sizeof(prk));
+	memset(salt, 0, sizeof(salt));
+	memset(info, 0, sizeof(info));
+	memset(ecc_private_key, 0, sizeof(ecc_private_key));
+}
+
+/* ML-KEM scratch for the two DERIVED X-Wing entry points.
+ *
+ * The stored-slot functions (okcrypto_xwing_getpubkey()/_decaps()) scratch at
+ * the BASE of ctap_buffer, which is safe for them: they are only ever reached
+ * from okcore.cpp's raw-HID dispatch, where no CTAP request is in flight.
+ *
+ * The derived pair is different - it is also reached from inside
+ * ok_extension.cpp, in the middle of servicing a CTAPHID getAssertion whose
+ * request bytes ARE ctap_buffer. Scratching at the base wrote 3584 bytes over
+ * that live request and then zeroed them, so the assertion the browser got back
+ * was built on a wiped buffer. Symptom: the derive call rejected with
+ * NotAllowedError while a plain OKCONNECT over the identical path succeeded.
+ *
+ * The first attempt at a fix moved the scratch to the TAIL of ctap_buffer, and
+ * that was worse. large_buffer IS the tail - ctap_buffer[5465,6585) - and it is
+ * where okcrypto_decrypt() stages the ciphertext it hands to
+ * okcrypto_xwing_derive_decaps() as `ct`. pk_M landed at [5401,6585), covering
+ * the whole of it, so crypto_kem_keypair_derand() overwrote the ciphertext
+ * before crypto_kem_dec() read it. ML-KEM's implicit rejection meant the
+ * decapsulation still reported success and returned a deterministic value with
+ * nothing to do with the sender's ciphertext: every derived-key file would have
+ * failed to decrypt, with no error anywhere. Found by review, not on hardware -
+ * the hardware pass ran on the build before the move.
+ *
+ * So the scratch goes BETWEEN the two: above whatever an inbound CTAP request
+ * occupies, entirely below large_buffer. Both edges are asserted, because the
+ * whole history of this constant is one edge being fixed by breaking the other.
+ */
+#define XWING_DERIVE_SCRATCH_SIZE  (MLKEM_SK_SIZE + MLKEM_PK_SIZE)   /* 3584 */
+#define XWING_DERIVE_SCRATCH_OFF   (CTAPHID_BUFFER_SIZE - LARGE_BUFFER_SIZE - XWING_DERIVE_SCRATCH_SIZE)
+static_assert(XWING_DERIVE_SCRATCH_OFF >= 1024,
+	"ctap_buffer scratch would collide with an in-flight CTAP request");
+static_assert(XWING_DERIVE_SCRATCH_OFF + XWING_DERIVE_SCRATCH_SIZE
+	              <= CTAPHID_BUFFER_SIZE - LARGE_BUFFER_SIZE,
+	"ctap_buffer scratch would overlap large_buffer - the staged ciphertext");
+
+/* Derived recipient. out must be XWING_PK_SIZE (1216) bytes.
+ * Same expansion and layout as okcrypto_xwing_getpubkey(). */
+void okcrypto_xwing_derive_getpubkey (const uint8_t *label32, uint8_t *out) {
+	extern uint8_t ctap_buffer[CTAPHID_BUFFER_SIZE];
+	uint8_t seed[32];
+	uint8_t expanded[96];
+
+	okcrypto_xwing_derive_seed(label32, seed);
+	xwing_shake256(expanded, 96, seed, XWING_SEED_SIZE);
+
+	uint8_t *scratch = ctap_buffer + XWING_DERIVE_SCRATCH_OFF;
+	uint8_t *sk_M = scratch;
+	uint8_t *pk_M = scratch + MLKEM_SK_SIZE;
+	crypto_kem_keypair_derand(pk_M, sk_M, expanded);
+
+	memcpy(out, pk_M, MLKEM_PK_SIZE);
+	crypto_scalarmult_base(out + MLKEM_PK_SIZE, expanded + 64);   /* pk_X */
+
+	memset(seed, 0, sizeof(seed));
+	memset(expanded, 0, sizeof(expanded));
+	memset(scratch, 0, XWING_DERIVE_SCRATCH_SIZE);
+}
+
+/* Derived decapsulation. ct is XWING_CT_SIZE (1120) = ct_M(1088) || ct_X(32);
+ * out is the 32-byte X-Wing shared secret. Mirrors okcrypto_xwing_decaps()'s
+ * body. ct_M now never leaves the host-to-device direction and the seed never
+ * leaves the device at all. Returns 0 on success. */
+int okcrypto_xwing_derive_decaps (const uint8_t *label32, const uint8_t *ct, uint8_t *out) {
+	extern uint8_t ctap_buffer[CTAPHID_BUFFER_SIZE];
+	uint8_t seed[32];
+	uint8_t expanded[96];
+	uint8_t ss_M[32], ss_X[32], pk_X[32];
+	uint8_t *scratch = ctap_buffer + XWING_DERIVE_SCRATCH_OFF;   /* see note above */
+	uint8_t *sk_M = scratch;
+	uint8_t *pk_M = scratch + MLKEM_SK_SIZE;
+	int rc = -1;
+
+	okcrypto_xwing_derive_seed(label32, seed);
+	xwing_shake256(expanded, 96, seed, XWING_SEED_SIZE);
+
+	if (crypto_kem_keypair_derand(pk_M, sk_M, expanded) == 0) {
+		crypto_scalarmult_base(pk_X, expanded + 64);
+		if (crypto_kem_dec(ss_M, ct, sk_M) == 0) {
+			crypto_scalarmult(ss_X, expanded + 64, ct + MLKEM_CT_SIZE);  /* ct_X */
+			xwing_combiner(out, ss_M, ss_X, ct + MLKEM_CT_SIZE, pk_X);
+			rc = 0;
+		}
+	}
+
+	memset(seed, 0, sizeof(seed));
+	memset(expanded, 0, sizeof(expanded));
+	memset(ss_M, 0, sizeof(ss_M));
+	memset(ss_X, 0, sizeof(ss_X));
+	memset(pk_X, 0, sizeof(pk_X));
+	memset(scratch, 0, XWING_DERIVE_SCRATCH_SIZE);
+	return rc;
 }
 
 void okcrypto_getpubkey (uint8_t *buffer) {
@@ -272,7 +440,22 @@ void okcrypto_getpubkey (uint8_t *buffer) {
 	Serial.println("OKGETPUBKEY MESSAGE RECEIVED");
 	#endif
 	if (buffer[5] < 5 && !buffer[6]) { //Slot 101-132 are for ECC, 1-4 are for RSA
-		if (okcore_flashget_RSA ((int)buffer[5])) okcrypto_getrsapubkey(buffer);
+		if (okcore_flashget_RSA ((int)buffer[5])) {
+			/* okcrypto_getrsapubkey() sends (type * 128) bytes out of
+			 * rsa_publicN[MAX_RSA_KEY_SIZE=512]. For a composite PQC PGP slot
+			 * type is 7, so it sent 896 bytes: 384 past the array, straight to
+			 * the host, and send_transport_response() then memset()s the same
+			 * 896 bytes - 384 of them past the end. okcore_flashget_RSA() never
+			 * populates rsa_publicN for this type (it decrypts the 160-byte seed
+			 * blob into rsa_private_key and returns), so there was no public key
+			 * there to send in the first place. A composite key's public halves
+			 * come from okpqc_getpubkey(), not from an RSA modulus. */
+			if ((type & 0x0F) == KEYTYPE_PQC_PGP) {
+				hidprint("Error use OKGETPUBKEY PQC for composite keys");
+			} else {
+				okcrypto_getrsapubkey(buffer);
+			}
+		}
 	} else if (buffer[5] < 117) { //128-132 are reserved
 		if (okcore_flashget_ECC ((int)buffer[5])) {
 			if (type == KEYTYPE_MLKEM768) okcrypto_mlkem_getpubkey(buffer);
@@ -282,14 +465,43 @@ void okcrypto_getpubkey (uint8_t *buffer) {
 	} else if (buffer[5] == RESERVED_KEY_DERIVATION && buffer[6] <= KEYTYPE_CURVE25519) { // Generate key using provided data, return public
 	okcrypto_derive_key(buffer[6], buffer+7, NULL);
 	send_transport_response(ecc_public_key, 64, false, false);
-	} else if (buffer[5] == RESERVED_KEY_WEB_DERIVATION && (buffer[6] & 0x0F) == KEYTYPE_XWING) {
-		// Derived X-Wing recipient over HID: buffer[7..39] = 32-byte label tag.
-		// Returns [ pk_X(32) | mlkem_seed(32) ]. See okcrypto_xwing_web_derive.
-		uint8_t out64[64];
-		okcrypto_xwing_web_derive(buffer + 7, NULL, out64);
-		send_transport_response(out64, 64, false, false);
-		memset(out64, 0, 64);
+	} else if (buffer[5] == RESERVED_KEY_WEB_AGENT_DERIVATION && (buffer[6] & 0x0F) == KEYTYPE_XWING) {
+		// Derived X-Wing recipient: buffer[7..39] = 32-byte label tag.
+		// Returns the full public recipient [ pk_M(1184) | pk_X(32) ] - the same
+		// XWING_PK_SIZE payload okcrypto_xwing_getpubkey() returns for a stored
+		// slot. It used to return [ pk_X(32) | mlkem_seed(32) ]: 32 bytes of
+		// PRIVATE key material handed out in answer to a request for a PUBLIC
+		// key. ML-KEM has no short public key, and the only 32-byte value that
+		// reproduces pk_M also reproduces sk_M, so there was no encoding fix -
+		// the public key itself has to be the thing that is sent.
+		//
+		// 1216 bytes fits both transports: raw HID chunks at 64
+		// (send_transport_response), and WebAuthn stages into large_resp_buffer
+		// (LARGE_RESP_BUFFER_SIZE) for chunked retrieval by send_stored_response() - the path
+		// already carrying a 3309-byte ML-DSA-65 signature.
+		okcrypto_xwing_derive_getpubkey(buffer + 7, large_resp_buffer);
+		send_transport_response(large_resp_buffer, XWING_PK_SIZE, true, true);
 	}
+}
+
+/* Reassembly state for the derived X-Wing decapsulation request that arrives
+ * over OKDECRYPT in multiple HID reports. File scope, not function statics,
+ * because the request is reassembled across one call sequence, held across the
+ * user-confirmation wait, and consumed by a later re-entry from
+ * okcore_run_pending_op() - and because wipetasks() has to be able to drop it.
+ *
+ * derive_pending distinguishes "confirmed a request we actually staged" from a
+ * re-entry with CRYPTO_AUTH == 4 left over from some other operation; without
+ * it, a stale large_buffer would be decapsulated as if it were a request. */
+static uint8_t derive_label[32];
+static int     derive_offset  = 0;
+static uint8_t derive_pending = 0;
+
+void okcrypto_derive_reset (void) {
+	derive_offset  = 0;
+	derive_pending = 0;
+	memset(derive_label, 0, sizeof(derive_label));
+	memset(large_buffer, 0, LARGE_BUFFER_SIZE);
 }
 
 void okcrypto_decrypt (uint8_t *buffer){
@@ -299,7 +511,7 @@ void okcrypto_decrypt (uint8_t *buffer){
 	Serial.println();
 	Serial.println("OKDECRYPT MESSAGE RECEIVED");
 	#endif
-	if (buffer[5] == RESERVED_KEY_WEB_DERIVATION) {
+	if (buffer[5] == RESERVED_KEY_WEB_AGENT_DERIVATION) {
 		// Derived X-Wing decaps over HID (split custody): label(32)+ct_X(32)
 		// =64B exceeds one 57-byte HID report, so the host
 		// (derive_decaps(), onlykey_hid.py) sends it via
@@ -325,27 +537,179 @@ void okcrypto_decrypt (uint8_t *buffer){
 		// dead code given the above, never actually reached; moot now that
 		// this reassembles into its own right-sized buffer below instead of
 		// reading straight out of the raw per-report buffer.)
-		// RESERVED_KEY_WEB_DERIVATION (128) is unique within OKDECRYPT's
+		// RESERVED_KEY_WEB_AGENT_DERIVATION (128) is unique within OKDECRYPT's
 		// dispatch, so buffer[5] alone is enough to recognize every chunk of
 		// this request.
-		static uint8_t derive_buf[64];
-		static int derive_offset = 0;
-		if (buffer[6] == 0xFF) {
-			if (derive_offset + 57 <= 64) {
-				memcpy(derive_buf + derive_offset, buffer + 7, 57);
-				derive_offset += 57;
+		//
+		// WIRE CHANGE (rev 3): the payload is now
+		//     [ label32(32) | ct(1120) ] = 32 + XWING_CT_SIZE = 1152 bytes
+		// where ct = ct_M(1088) || ct_X(32) - the WHOLE X-Wing ciphertext - and
+		// the reply is the 32-byte X-Wing shared secret. Previously the host
+		// sent label32 || ct_X (64 B) and got back ss_X || mlkem_seed, then
+		// finished the ML-KEM half itself from the seed. ct_M never reached the
+		// device and the seed always reached the host; this reverses both, so
+		// the derived path custodies its whole key exactly as the stored path
+		// does.
+		//
+		// Reassembly keeps the label in its own 32 bytes and streams the
+		// ciphertext into large_buffer (LARGE_BUFFER_SIZE == XWING_CT_SIZE ==
+		// 1120, an exact fit), so no buffer constant changes and the added RAM
+		// cost is 32 bytes.
+		//
+		// USER PRESENCE: this path used to answer the moment the last chunk
+		// landed, with no button gate at all - the FIDO2 route in
+		// ok_extension.cpp had its own, raw HID had none. It now goes through
+		// the same confirmation machinery as every other decrypt: the final
+		// chunk primes the challenge (okcore_prime_user_confirmation) and
+		// returns, and okcore_run_pending_op() re-enters here with
+		// CRYPTO_AUTH == 4 once the user has confirmed. The reassembled
+		// request is what the challenge code is computed over, so the code
+		// shown on the device is bound to the exact label and ciphertext being
+		// decapsulated - and matches what the FIDO2 path shows for the same
+		// request.
+		//
+		// The staged request is NOT encrypted into large_buffer the way
+		// done_process_packets() encrypts packet_buffer, because neither half
+		// of it is secret: ct is the sender's public ciphertext and the label
+		// tag is public derivation input. What matters is that they cannot be
+		// swapped between priming and confirmation, which the challenge hash
+		// covers.
+		if (CRYPTO_AUTH == 4) {
+			// Confirmed. derive_label/large_buffer still hold the request.
+			if (derive_pending != 1) {
+				hidprint("Error no derived decaps request pending");
+				fadeoff(0);
+				return;
 			}
+			derive_pending = 0;
+			uint8_t ss[XWING_SS_SIZE];
+			if (okcrypto_xwing_derive_decaps(derive_label, large_buffer, ss) != 0) {
+				hidprint("Error X-Wing derived decaps failed");
+				fadeoff(0);
+			} else {
+				send_transport_response(ss, XWING_SS_SIZE, true, true);
+			}
+			memset(ss, 0, sizeof(ss));
+			memset(derive_label, 0, sizeof(derive_label));
+			memset(large_buffer, 0, LARGE_BUFFER_SIZE);
+			// Release the LED/button state primed by the OKDECRYPT dispatcher's
+			// fadeon(128); without this isfade stayed set, the LED faded
+			// turquoise forever and every button press (config mode included)
+			// was ignored until the key was re-plugged. Seen on hardware
+			// 2026-09-03.
+			fadeoff(85);
+			return;
+		} else if (CRYPTO_AUTH) {
+			return; // confirmation in progress, ignore stray traffic
+		}
+
+		const int derive_total = 32 + XWING_CT_SIZE;
+		int n = (buffer[6] == 0xFF) ? 57 : buffer[6];
+
+		/* buffer is recv_buffer[64], so a report carries at most 57 payload
+		 * bytes. buffer[6] is a length from the wire and only 0xFF was special-
+		 * cased, so 58..254 passed straight through and the copy below read
+		 * buffer[7 + i] well past the 64-byte packet into neighbouring globals,
+		 * folding them into the ciphertext. (`n < 0` below never fired - n comes
+		 * from a uint8_t.)
+		 *
+		 * This has to be checked BEFORE the padding tolerance underneath, which
+		 * exists to forgive a tail a few bytes longer than the payload: an
+		 * out-of-range length must be refused, not quietly clamped into range. */
+		if (buffer[6] != 0xFF && buffer[6] > 57) {
+			okcrypto_derive_reset();
+			hidprint("Error derived decaps chunk size");
+			fadeoff(0);
 			return;
 		}
-		if (derive_offset + buffer[6] == 64) {
-			memcpy(derive_buf + derive_offset, buffer + 7, buffer[6]);
+
+		// The FINAL report's length is the keyhandle's data length, and
+		// encode_ctaphid_request_as_keyhandle() zero-pads every keyhandle up to
+		// 16 bytes of data because is_extension_request() needs that much to
+		// match. A genuine tail shorter than 16 therefore arrives claiming 16,
+		// and the host has no way to say otherwise.
+		//
+		// [label32 | ct1120] is 1152 bytes and 1152 = 20*57 + 12, so this tail
+		// is ALWAYS 12 bytes and always claims 16. No host-side chunk size
+		// avoids it: ok_extension.cpp re-chunks into 57-byte reports and counts
+		// every non-final one as a full 57, so every host chunk but the last
+		// must be a multiple of 57 - which fixes the final remainder at
+		// 1152 mod 57 regardless of how the payload is split.
+		//
+		// Measured on hardware 2026-09-15: 21 reports arrived, derive_offset
+		// reached 1156 against a 1152 expectation, and a correct ciphertext was
+		// dropped with "Error derived decaps payload size" over four bytes of
+		// transport padding.
+		//
+		// So trust derive_total over the padded length, for the last report
+		// only and only when the overshoot is small enough to BE padding.
+		// Anything larger is still a desynchronised request and still dropped:
+		// this must not become the silent truncation TC-17 was.
+		if (buffer[6] != 0xFF && derive_offset + n > derive_total
+		    && derive_offset + n - derive_total < 16) {
+			n = derive_total - derive_offset;
+		}
+
+		if (n < 0 || derive_offset + n > derive_total) {
+			// Overlong or desynchronised: drop the whole request rather than
+			// decapsulate against a half-filled buffer. Silent truncation here
+			// is exactly what TC-17 looked like from the host side.
+			okcrypto_derive_reset();
+			hidprint("Error derived decaps payload size");
+			fadeoff(0);
+			return;
+		}
+		for (int i = 0; i < n; i++) {
+			int pos = derive_offset + i;
+			if (pos < 32) derive_label[pos] = buffer[7 + i];
+			else          large_buffer[pos - 32] = buffer[7 + i];
+		}
+		derive_offset += n;
+		if (buffer[6] == 0xFF) return;            /* more chunks coming */
+
+		if (derive_offset != derive_total) {
+			okcrypto_derive_reset();
+			hidprint("Error derived decaps payload size");
+			fadeoff(0);
+			return;
 		}
 		derive_offset = 0;
-		uint8_t out64[64];
-		okcrypto_xwing_web_derive(derive_buf, derive_buf + 32, out64);
-		send_transport_response(out64, 64, false, false);
-		memset(out64, 0, 64);
-		memset(derive_buf, 0, 64);
+		derive_pending = 1;
+
+		// Prime the confirmation over the whole reassembled request. Two
+		// updates rather than one concatenated buffer: there is no 1152-byte
+		// scratch space to build it in, and the hash is the same either way.
+		{
+			SHA256_CTX ch;
+			uint8_t chmsg[32];
+			sha256_init(&ch);
+			sha256_update(&ch, derive_label, 32);
+			sha256_update(&ch, large_buffer, XWING_CT_SIZE);
+			sha256_final(&ch, chmsg);
+			okcore_prime_user_confirmation(OKDECRYPT, RESERVED_KEY_WEB_AGENT_DERIVATION,
+			                               chmsg, sizeof(chmsg));
+			memset(chmsg, 0, sizeof(chmsg));
+		}
+		pending_operation = OKDECRYPT_ERR_USER_ACTION_PENDING;
+		// Actually SIGNAL that input is wanted.
+		//
+		// okcore_prime_user_confirmation() sets isfade and CRYPTO_AUTH but never
+		// starts FadeinTask, so on its own the LED does not pulse - it just
+		// holds whatever solid colour was last set. Every other confirmation
+		// reaches the user through done_process_packets(), which ends with
+		// fadeon(NEO_Color); this path returned straight to the caller instead
+		// and so was the only confirmation on the device with no visible
+		// prompt at all.
+		//
+		// Reported from hardware 2026-09-15: "solid yellow then green" across
+		// three attempts, and correctly read as NOT a request for input - a
+		// waiting OnlyKey pulses. The operation was in fact waiting, and timed
+		// out after 20 s having never asked for anything.
+		//
+		// NEO_Color is defined in okcore.cpp and not declared in any header;
+		// ok_extension.cpp externs it locally for the same reason.
+		extern uint8_t NEO_Color;
+		fadeon(NEO_Color);
 		return;
 	}
 	if (buffer[5] < 101) { //Slot 101-132 are for ECC, 1-4 are for RSA
@@ -600,11 +964,11 @@ void okcrypto_derive_key (uint8_t ktype, uint8_t *data, uint8_t slot) {
 		Serial.println("Agent derivation private key");
 		byteprint(ecc_private_key,32);
 		#endif
-  	} else if (slot==RESERVED_KEY_WEB_DERIVATION) { //HMAC SHA256 KDF used for web requests
+  	} else if (slot==RESERVED_KEY_WEB_AGENT_DERIVATION) { //HMAC SHA256 KDF used for web requests
 	  	okcore_flashget_ECC (slot); 
 		#ifdef DEBUG
 		Serial.println();
-		Serial.println("Web derivation key");
+		Serial.println("Web and agent derivation key");
 		byteprint(ecc_private_key,32);
 		Serial.println("Other data");
 		byteprint(data,33);
@@ -648,6 +1012,19 @@ void okcrypto_ecdsa_eddsa(uint8_t *buffer)
 		uint8_t tmp[32 + 32 + 64];
 		SHA256_HashContext ectx = {{&init_SHA256, &update_SHA256, &finish_SHA256, 64, 32, tmp}};
 		if (buffer[5] > 200) {
+			/* 201/202/203 (SSH/GPG) and 211/212/213 (web-and-agent domain) are
+			 * the whole set. okcrypto_sign() routes 201..204 here, so 204 -
+			 * which names no key type - fell through this chain with `type` and
+			 * ecc_private_key left over from whatever ran last, and then signed
+			 * with them, or (for a stale type outside 1..3) returned the
+			 * uninitialised ecc_signature[64] as if it were a signature.
+			 * Reject it rather than letting stale state decide. */
+			if (buffer[5] != 201 && buffer[5] != 202 && buffer[5] != 203 &&
+			    buffer[5] != 211 && buffer[5] != 212 && buffer[5] != 213) {
+				hidprint("Error invalid derived key slot");
+				fadeoff(0);
+				return;
+			}
 			if (buffer[5] == 201) {
 				//Used by SSH, old version used 132, new version uses 201 for type 1
 				okcrypto_derive_key(1, large_buffer+(large_buffer_offset-32), NULL);
@@ -658,13 +1035,13 @@ void okcrypto_ecdsa_eddsa(uint8_t *buffer)
 			else if (buffer[5] == 203) {
 				okcrypto_derive_key(3, large_buffer+(large_buffer_offset-32), NULL);
 			} else if (buffer[5] == 211) {
-				okcrypto_derive_key(1, large_buffer+(large_buffer_offset-32), RESERVED_KEY_WEB_DERIVATION);
+				okcrypto_derive_key(1, large_buffer+(large_buffer_offset-32), RESERVED_KEY_WEB_AGENT_DERIVATION);
 			}
 			else if (buffer[5] == 212) {
-				okcrypto_derive_key(2, large_buffer+(large_buffer_offset-32), RESERVED_KEY_WEB_DERIVATION);
+				okcrypto_derive_key(2, large_buffer+(large_buffer_offset-32), RESERVED_KEY_WEB_AGENT_DERIVATION);
 			}
 			else if (buffer[5] == 213) {
-				okcrypto_derive_key(3, large_buffer+(large_buffer_offset-32), RESERVED_KEY_WEB_DERIVATION);
+				okcrypto_derive_key(3, large_buffer+(large_buffer_offset-32), RESERVED_KEY_WEB_AGENT_DERIVATION);
 			}
 			large_buffer_offset = large_buffer_offset - 32;
 		}
@@ -694,6 +1071,14 @@ void okcrypto_ecdsa_eddsa(uint8_t *buffer)
 	  	byteprint(ecc_private_key, sizeof(ecc_private_key));
 		#endif
 		pending_operation=CTAP2_ERR_OPERATION_PENDING;			
+		/* The chain below has no else: a `type` outside 1..3 signed nothing and
+		 * the uninitialised ecc_signature[64] went to the host as the result -
+		 * 64 bytes of whatever that stack frame last held. Fail instead. */
+		if (type != 0x01 && type != 0x02 && type != 0x03) {
+			hidprint("Error key not set as signature key");
+			fadeoff(0);
+			return;
+		}
 		if (type==0x01) Ed25519::sign(ecc_signature, ecc_private_key, ecc_public_key, large_buffer, large_buffer_offset);
 		else if (type==0x02) {
 			const struct uECC_Curve_t * curve = uECC_secp256r1(); //P-256
@@ -777,13 +1162,13 @@ void okcrypto_ecdh(uint8_t *buffer) {
 			else if (buffer[5] == 204) {
 				okcrypto_derive_key(4, large_buffer+(large_buffer_offset-32), NULL); 
 			} else if (buffer[5] == 212) {
-				okcrypto_derive_key(2, large_buffer+(large_buffer_offset-32), RESERVED_KEY_WEB_DERIVATION);
+				okcrypto_derive_key(2, large_buffer+(large_buffer_offset-32), RESERVED_KEY_WEB_AGENT_DERIVATION);
 			}
 			else if (buffer[5] == 213) {
-				okcrypto_derive_key(3, large_buffer+(large_buffer_offset-32), RESERVED_KEY_WEB_DERIVATION);
+				okcrypto_derive_key(3, large_buffer+(large_buffer_offset-32), RESERVED_KEY_WEB_AGENT_DERIVATION);
 			} 
 			else if (buffer[5] == 214) {
-				okcrypto_derive_key(4, large_buffer+(large_buffer_offset-32), RESERVED_KEY_WEB_DERIVATION); 
+				okcrypto_derive_key(4, large_buffer+(large_buffer_offset-32), RESERVED_KEY_WEB_AGENT_DERIVATION); 
 			} 
 			large_buffer_offset = large_buffer_offset - 32; //Remove derivation data hash
 		}
@@ -1011,34 +1396,171 @@ void crypto_sha512_final(uint8_t * hash) {
 	mbedtls_md_free (&sha512_ctx);
 }
 
-void okcrypto_aes_crypto_box (uint8_t *buffer, int len, bool open) {
-	uint8_t iv[12];
-	memset(iv, 0, 12);
-	//msgcount++;
-	//int ctr = ((msgcount>>24)&0xff) | // move byte 3 to byte 0
-	//  ((msgcount<<8)&0xff0000) | // move byte 1 to byte 2
-	//  ((msgcount>>8)&0xff00) | // move byte 2 to byte 1
-	//  ((msgcount<<24)&0xff000000); // byte 0 to byte 3
-	//memcpy(iv, &ctr, 4);
-	#ifdef DEBUG
-	Serial.print("IV");
-	byteprint(iv, 12);
-	#endif
-	#ifdef DEBUG
-	Serial.print("Key");
-	byteprint(transit_key, 32);
-	#endif
-	#ifdef DEBUG
-	Serial.print("buffer");
-	byteprint(buffer, len);
-	#endif
-	if (open) {
-		okcrypto_aes_gcm_decrypt2 (buffer, iv, transit_key, len, false);
-	}
-	else {
-		okcrypto_aes_gcm_encrypt2 (buffer, iv, transit_key, len, false);
-	}
+/* ---- FIDO2 transit encryption, v2 --------------------------------------
+ *
+ * The transit key is a fresh ECDH secret per OKCONNECT, which is why a fixed
+ * IV looked defensible. It is not: many messages ride each key. Every chunk of
+ * a multi-part request is a separate GCM operation on the host side, and every
+ * response is another - all under one key and, until now, one all-zero IV. Same
+ * key and same IV means the same keystream, so any two messages in a session
+ * XOR to the XOR of their plaintexts.
+ *
+ * That was directly exploitable rather than merely untidy. A plain OKCONNECT
+ * answers with the status string "UNLOCKEDv<version>" in the clear (opt3 is 0
+ * on that request, so store_FIDO_response() does not encrypt it), and the very
+ * next OKCONNECT - the derive one - encrypts that same string at a known
+ * offset under the session key. XOR the two and the leading keystream for the
+ * session falls out; every other message starts at keystream offset zero, so
+ * the head of each one follows, and a derived X-Wing shared secret is only 32
+ * bytes. `tagLength: 0` on the host meant there was no authentication either,
+ * so the same keystream let an attacker flip bits undetected.
+ *
+ * GCM's requirement is that (key, IV) never repeats - NOT that a key encrypt
+ * only one message. A counter gives that directly, without restructuring the
+ * chunking:
+ *
+ *     IV = [dir(1)][counter big-endian(4)][zero(7)]
+ *
+ * The direction byte matters. With one shared counter, or two counters both
+ * starting at zero, the first request and the first response collide on the
+ * same IV under the same key - the original bug, just rarer. dir 0 is
+ * device->host and dir 1 is host->device, so the two directions can never meet.
+ *
+ * THE COUNTER TRAVELS ON THE WIRE, in the clear, ahead of the ciphertext:
+ *
+ *     [counter big-endian(4)][ciphertext(n)][tag(16)]
+ *
+ * so neither side has to track what the other has sent. That is not a
+ * refinement, it is the only version of this that survives contact with this
+ * transport:
+ *
+ *   - Windows 10 1903 delivers every FIDO2 request twice. The duplicate is
+ *     recognised and dropped further down (opt3 <= last_request_opt3), but the
+ *     decrypt happens first, so a receiver-side counter would advance twice for
+ *     one host-side increment and every message after it would fail its tag.
+ *   - A derive request is itself an OKCONNECT and replaces the transit key
+ *     mid-session. The host has already had one bug from holding a stale
+ *     sharedsec across exactly that rekey; a stale counter would be the same
+ *     bug with a worse failure mode.
+ *
+ * The counter is not covered by any AAD and does not need to be: GCM derives
+ * its whole tag computation from the IV, so a flipped counter fails the tag.
+ *
+ * Counters still restart whenever the transit key does - okcrypto_transit_reset()
+ * is called wherever the key is established - so a session never gets near
+ * 2^32 messages and the value stays small enough to read in a trace.
+ *
+ * Compatibility: this is a clean break, gated on the firmware version. The
+ * plain OKCONNECT response is unencrypted, so a host reads the version out of
+ * it before any of this applies and picks the scheme from there. Old firmware
+ * with a new host keeps working. A NEW firmware with an OLD host does not -
+ * the old host sends no counter and no tag, and every request fails to
+ * authenticate.
+ */
+static uint32_t transit_ctr_out = 0;   /* device -> host */
+
+void okcrypto_transit_reset (void) {
+	transit_ctr_out = 0;
 }
+
+static void okcrypto_transit_iv (uint8_t *iv, uint8_t dir, uint32_t ctr) {
+	memset(iv, 0, 12);
+	iv[0] = dir;
+	iv[1] = (uint8_t)(ctr >> 24);
+	iv[2] = (uint8_t)(ctr >> 16);
+	iv[3] = (uint8_t)(ctr >> 8);
+	iv[4] = (uint8_t)(ctr);
+}
+
+/* Seal a frame in place.
+ *
+ * `frame` points at the 4-byte counter field, which this writes; the plaintext
+ * must already be sitting at frame + OKCRYPTO_TRANSIT_CTR_LEN and be `len`
+ * bytes long. The caller owns len + OKCRYPTO_TRANSIT_OVERHEAD bytes at
+ * `frame`. Returns the framed length. */
+int okcrypto_transit_seal (uint8_t *frame, int len) {
+	#ifdef STD_VERSION
+	uint8_t iv[12];
+	uint32_t ctr = transit_ctr_out++;
+	uint8_t *ct = frame + OKCRYPTO_TRANSIT_CTR_LEN;
+	GCM<AES256> gcm;
+	frame[0] = (uint8_t)(ctr >> 24);
+	frame[1] = (uint8_t)(ctr >> 16);
+	frame[2] = (uint8_t)(ctr >> 8);
+	frame[3] = (uint8_t)(ctr);
+	okcrypto_transit_iv(iv, OKCRYPTO_TRANSIT_DIR_OUT, ctr);
+	gcm.clear();
+	gcm.setKey(transit_key, 32);
+	gcm.setIV(iv, 12);
+	gcm.encrypt(ct, ct, len);
+	gcm.computeTag(ct + len, OKCRYPTO_TRANSIT_TAG_LEN);
+	#ifdef DEBUG
+	Serial.print("transit seal ctr=");
+	Serial.print(ctr);
+	Serial.print(" len=");
+	Serial.println(len);
+	#endif
+	return len + OKCRYPTO_TRANSIT_OVERHEAD;
+	#else
+	return len;
+	#endif
+}
+
+/* Open a frame in place.
+ *
+ * `frame` is [counter(4)][ciphertext(n)][tag(16)] and `len` is the whole of
+ * that. On success the plaintext is moved down to frame[0] - so callers keep
+ * indexing from the start of their buffer as they always have - and its length
+ * is returned. On failure returns -1 and the buffer is wiped.
+ *
+ * A failure means these bytes were not produced by something holding the
+ * transit key. There is no partial acceptance: the caller discards the whole
+ * request rather than acting on any of it. */
+int okcrypto_transit_open (uint8_t *frame, int len) {
+	#ifdef STD_VERSION
+	uint8_t iv[12];
+	uint8_t tag[OKCRYPTO_TRANSIT_TAG_LEN];
+	uint8_t *ct = frame + OKCRYPTO_TRANSIT_CTR_LEN;
+	uint32_t ctr;
+	GCM<AES256> gcm;
+	int ptlen = len - OKCRYPTO_TRANSIT_OVERHEAD;
+	if (ptlen < 0) {
+		memset(frame, 0, len > 0 ? len : 0);
+		return -1;
+	}
+	ctr = ((uint32_t)frame[0] << 24) | ((uint32_t)frame[1] << 16) |
+	      ((uint32_t)frame[2] << 8)  |  (uint32_t)frame[3];
+	memcpy(tag, ct + ptlen, OKCRYPTO_TRANSIT_TAG_LEN);
+	okcrypto_transit_iv(iv, OKCRYPTO_TRANSIT_DIR_IN, ctr);
+	gcm.clear();
+	gcm.setKey(transit_key, 32);
+	gcm.setIV(iv, 12);
+	gcm.decrypt(ct, ct, ptlen);
+	if (!gcm.checkTag(tag, OKCRYPTO_TRANSIT_TAG_LEN)) {
+		/* Wipe rather than leave a plausible-looking plaintext behind. */
+		memset(frame, 0, len);
+		return -1;
+	}
+	memmove(frame, ct, ptlen);
+	memset(frame + ptlen, 0, len - ptlen);
+	#ifdef DEBUG
+	Serial.print("transit open ctr=");
+	Serial.print(ctr);
+	Serial.print(" len=");
+	Serial.println(ptlen);
+	#endif
+	return ptlen;
+	#else
+	return len;
+	#endif
+}
+
+/* okcrypto_aes_crypto_box() lived here. It was AES-GCM under the transit key
+ * with a hardcoded all-zero IV and the tag check commented out - a raw
+ * keystream XOR, reused for every message of a session in both directions. It
+ * is gone rather than deprecated: leaving a working same-IV primitive next to
+ * the sealed one is an invitation to call the wrong one. Use
+ * okcrypto_transit_seal() and okcrypto_transit_open() above. */
 
 int rsa_sign (int mlen, const uint8_t *msg, uint8_t *out)
 {
@@ -1316,7 +1838,15 @@ void okcrypto_hkdf(const void *salt, const void *inputKey, void *outputKey, cons
 	SHA256 hash;
 	uint8_t PRK[hash.hashSize()];
 	void *s;
-	uint8_t tmp[32];
+	// 33, not 32: the salt this function is called with is the 33-byte
+	// additional_data ([flag][32-byte tag]), and the salt == NULL branch below
+	// zero-fills and then HMAC-keys 33 bytes from here. At 32 that wrote one
+	// byte past the end of this buffer and read one byte past it as key
+	// material. Unreachable today - okcrypto_derive_key(), the only caller,
+	// always passes a non-NULL 33-byte salt - but the trap was live for the
+	// next caller. Sized off the salt length rather than the hash length on
+	// purpose; they are not the same quantity.
+	uint8_t tmp[33];
 	int N = L / hash.hashSize();
 	int i = 0;
 	uint8_t rpid[255] ={0};
@@ -1345,7 +1875,7 @@ void okcrypto_hkdf(const void *salt, const void *inputKey, void *outputKey, cons
 
 	if (salt == NULL) {
 		s = tmp;
-		memset(s, 0, 33);
+		memset(s, 0, sizeof(tmp));
 	} else {
 		s = (void *) salt;
 	}
@@ -1855,7 +2385,7 @@ void okcrypto_mlkem_keygen (uint8_t *buffer) {
 	Serial.println();
 	Serial.println("MLKEM KEYGEN MESSAGE RECEIVED");
 	#endif
-	if (!CRYPTO_AUTH) {
+	if (!CRYPTO_AUTH && !configmode) {
 		pending_operation=CTAP2_ERR_USER_ACTION_PENDING;
 		return;
 	}
@@ -1999,7 +2529,7 @@ void okcrypto_xwing_keygen (uint8_t *buffer) {
 	Serial.println();
 	Serial.println("XWING KEYGEN MESSAGE RECEIVED");
 	#endif
-	if (!CRYPTO_AUTH) {
+	if (!CRYPTO_AUTH && !configmode) {
 		pending_operation=CTAP2_ERR_USER_ACTION_PENDING;
 		return;
 	}

@@ -97,7 +97,27 @@ extern void okcrypto_decrypt (uint8_t *buffer);
 extern void okcrypto_hmacsha1 ();
 extern void okcrypto_derive_key (uint8_t type, uint8_t *data, uint8_t slot);
 extern int okcrypto_shared_secret (uint8_t *pub, uint8_t *secret);
-extern void okcrypto_aes_crypto_box (uint8_t *buffer, int len, bool open);
+
+/* FIDO2 transit encryption v2. Frame on the wire, both directions:
+ *
+ *     [counter big-endian(4)][ciphertext(n)][tag(16)]
+ *
+ * with IV = [dir(1)][counter(4)][zero(7)]. See okcrypto.cpp for why the IV is
+ * a counter, why the counter is sent rather than tracked, and what this breaks. */
+#define OKCRYPTO_TRANSIT_TAG_LEN  16
+#define OKCRYPTO_TRANSIT_CTR_LEN  4
+#define OKCRYPTO_TRANSIT_OVERHEAD (OKCRYPTO_TRANSIT_CTR_LEN + OKCRYPTO_TRANSIT_TAG_LEN)
+#define OKCRYPTO_TRANSIT_DIR_OUT  0   /* device -> host */
+#define OKCRYPTO_TRANSIT_DIR_IN   1   /* host -> device */
+/* A FIDO2 credential id is 255 bytes with a 10-byte header, so one inbound
+ * message carries 245. The host must therefore chunk at 224 (224 + 20 = 244).
+ * That is down from 228 and changes no chunk count: RSA-4096 512 B still takes
+ * 3, an ML-KEM-768 ciphertext 1088 B still takes 5, and a derived X-Wing
+ * [label(32) | ct(1120)] 1152 B still takes 6. */
+#define OKCRYPTO_TRANSIT_MAX_FRAME 244
+extern void okcrypto_transit_reset (void);
+extern int  okcrypto_transit_seal (uint8_t *frame, int len);
+extern int  okcrypto_transit_open (uint8_t *frame, int len);
 extern void okcrypto_getpubkey (uint8_t *buffer);
 extern void okcrypto_generate_random_key (uint8_t *buffer);
 extern void okcrypto_geteccpubkey (uint8_t *buffer);
@@ -140,7 +160,18 @@ extern void okcrypto_mlkem_getpubkey (uint8_t *buffer);
 extern void okcrypto_xwing_keygen (uint8_t *buffer);
 extern void okcrypto_xwing_decaps (uint8_t *buffer);
 extern void okcrypto_xwing_getpubkey (uint8_t *buffer);
-extern void okcrypto_xwing_web_derive (uint8_t *label32, uint8_t *ct_x, uint8_t *out64);
+/* Derived (label-based) X-Wing. See the block comment in okcrypto.cpp.
+ * HKDF (RFC 5869) produces a 32-byte X-Wing seed; the spec's own
+ * xwing_shake256() expansion then produces the keypair, exactly as the
+ * stored-slot path does. No private key material is returned to the host. */
+extern void okcrypto_hkdf_expand (const uint8_t *prk, const uint8_t *info, size_t info_len,
+                                  uint8_t *out, size_t L);
+extern void okcrypto_xwing_derive_seed (const uint8_t *label32, uint8_t *seed_out);
+extern void okcrypto_xwing_derive_getpubkey (const uint8_t *label32, uint8_t *out);  /* XWING_PK_SIZE */
+extern int  okcrypto_xwing_derive_decaps (const uint8_t *label32, const uint8_t *ct, uint8_t *out);
+/* Drop any partially reassembled / awaiting-confirmation derived decaps
+ * request. Called from wipetasks() and on every framing error. */
+extern void okcrypto_derive_reset (void);
 
 
 #ifdef __cplusplus

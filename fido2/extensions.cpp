@@ -106,10 +106,16 @@ int16_t bridge_u2f_to_extensions(uint8_t * _chal, uint8_t * _appid, uint8_t klen
 int16_t extend_fido2(CredentialId * credid, uint8_t * type, uint8_t * output)
 {
     if (*type == PUB_KEY_CRED_CUSTOM) {
-        if (is_extension_request((uint8_t*)credid, sizeof(CredentialId)))
+        extern struct _getAssertionState getAssertionState;
+        /* Gate on the length that is actually forwarded, not on the constant
+         * sizeof(CredentialId). The descriptor copy is always a fixed 68-byte
+         * field, so passing its size here made the WALLET_MIN_LENGTH check in
+         * is_extension_request() unconditionally true while a much shorter
+         * customCredIdSize was handed to the bridge - the mismatch that let a
+         * 9-byte credential id underflow bridge_to_onlykey()'s length. */
+        if (is_extension_request((uint8_t*)credid, getAssertionState.customCredIdSize))
         {
             printf1(TAG_EXT,"IS EXT REQ\r\n");
-            extern struct _getAssertionState getAssertionState;
             output[0] = bridge_u2f_to_solo(NULL, output+1, (uint8_t*)getAssertionState.customCredId, getAssertionState.customCredIdSize);
             return 1;
         }    

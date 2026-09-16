@@ -79,14 +79,27 @@
 #define ONLYKEY_H
 
 #define DEBUG //Enable Serial Monitor
-#define DEBUG_CTAP_VERBOSE //Enable verbose per-request CTAP/U2F presence-test logging (very noisy - fires on every presence test poll, floods Serial/SEREMU)
+//#define OK_ALLOW_NO_PRESS // Honour user-input mode 2 (no press) for stored/derived keys. Off in production: the write is refused and a stale 2 in EEPROM fails closed to challenge code.
+//#define OK_ALLOW_PQC_SEED_EXPORT // DEBUG builds only: lets the host read a raw ML-DSA private seed (okpqc.cpp). Never enable outside a bench investigation.
+//#define DEBUG_CTAP_VERBOSE //Enable verbose per-request CTAP/U2F presence-test logging (very noisy - fires on every presence test poll, floods Serial/SEREMU)
+//#define DEBUG_BULK_DUMPS //Hex-dump whole staged buffers (large_resp_buffer, AES in/out). Keep OFF while testing FIDO2.
+// A FIDO2 response has to reach the host inside the CTAPHID transaction; SEREMU
+// back-pressure inside that window delays it. One derived X-Wing response dumps
+// large_resp_buffer twice (1285 B) plus the AES buffer (1253 B) - roughly 15 KB
+// of hex, on top of ~560 ms of ML-KEM keygen, all before a single response frame
+// goes out. The one-line traces under plain DEBUG are cheap and stay on.
 
 #define STD_VERSION //Define for STD edition firmare, undefine for IN TRVL edition firmware
 #define OK_Color //Define for hardware with color LED
 #define FACTORYKEYS // Attestation key and other keys encrypted using CHIP ID and RNG for unique keys per device
 #define OKversionmaj "3"
 #define OKversionmin "0"
-#define OKversionpat "4"
+/* 3.0.5 is the FIRMWARE VERSION GATE for FIDO2 transit v2 (counter IV + GCM
+ * tag; see okcrypto.cpp). The host reads this string out of the plain OKCONNECT
+ * response - which is not encrypted - and picks its framing from it, so
+ * anything below 3.0.5 keeps the legacy scheme and anything at or above it
+ * speaks v2. onlykey.extra.js has the matching constant, TRANSIT_V2_MIN. */
+#define OKversionpat "5"
 
 #ifndef OKCORE_H
 #include "okcore.h"

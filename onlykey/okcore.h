@@ -121,7 +121,13 @@ extern "C"
 /*************************************/
 //Global Buffer Sizes
 /*************************************/
-#define LARGE_RESP_BUFFER_SIZE         3328
+/* 3392, up from 3328. The largest staged response is an ML-DSA-65 signature at
+ * 3309 bytes, and transit framing now adds 20 (a 4-byte counter and a 16-byte
+ * tag) to everything that crosses the FIDO2 tunnel encrypted - 3329, one byte
+ * over the old size. store_FIDO_response() rejects an oversized response rather
+ * than truncating it, so this would have failed loudly rather than corrupted
+ * anything, but it would have failed. 3392 leaves 63 bytes of headroom. */
+#define LARGE_RESP_BUFFER_SIZE         3392
 #define LARGE_BUFFER_SIZE         1120
 #define PACKET_BUFFER_SIZE         1120
 #define ATTESTATION_DER_BUFFER_SIZE 768
@@ -214,7 +220,28 @@ extern "C"
 #define RESERVED_KEY_DEFAULT_BACKUP 131
 #define RESERVED_KEY_HMACSHA1_1 130
 #define RESERVED_KEY_HMACSHA1_2 129
-#define RESERVED_KEY_WEB_DERIVATION 128
+/* Slot 128 - the WEB AND AGENT derivation key. Named for both because it serves
+ * both: the OnlyKey web app over FIDO2, and local tools over USB
+ * (onlykey-agent, python-onlykey, the age plugin). Calling it "web" hid the
+ * second half, which matters because the unattended-agent case runs over USB.
+ *
+ * This is deliberately the ACCESSIBLE tier, not the protected one. Keys here are
+ * reproducible from a label, reachable by the web app and by local agents, and
+ * can be configured (field 30) to need no confirmation at all. That is the
+ * trade: less protected than a stored slot, in exchange for being usable by
+ * software that has nobody sitting in front of it. Stored keys are the other
+ * end of that scale and are not reachable this way. */
+#define RESERVED_KEY_WEB_AGENT_DERIVATION 128
+/* Old name. Kept as an alias so branches still in flight keep compiling; new
+ * code should use the name above. */
+#define RESERVED_KEY_WEB_DERIVATION RESERVED_KEY_WEB_AGENT_DERIVATION
+
+/* Field 21 used to be a bitfield, then briefly an enum with policy flags packed
+ * into the high nibble. It is now a plain input-mode enum (USER_INPUT_*, see
+ * below) and nothing else; the policy bits live in their own byte, field 31
+ * (OKWC_*). okcore_user_input_mode_for_slot() reads the mode out of the legacy
+ * byte and okcore_webcrypt_policy() inherits the one legacy bit that expressed a
+ * restriction. */
 #define KEYTYPE_NACL 1
 #define KEYTYPE_ED25519 1
 #define KEYTYPE_P256R1 2
@@ -298,6 +325,37 @@ extern bool configmode;
 extern bool PDmode;
 extern int pin_set;
 extern int u2f_button;
+// User input modes. One enum for all three settings (OKSETSLOT 21 derived keys,
+// 22 stored keys, 30 web/FIDO2 derived keys): 0 = 3-digit challenge code,
+// 1 = any button press, 2 = none. For 21/22, 2 is only honoured in
+// OK_ALLOW_NO_PRESS builds (unattended agents); for 30 it is the default and
+// means the web app chooses per request via the REQ_PRESS variants.
+// user_input_mode is the mode resolved for the operation currently waiting.
+#define USER_INPUT_CHALLENGE 0
+#define USER_INPUT_PRESS 1
+#define USER_INPUT_NONE 2
+extern uint8_t user_input_mode;
+extern uint8_t pending_op_no_press;
+extern void okcore_run_pending_op();
+extern uint8_t okcore_user_input_mode_for_slot(uint8_t slot);
+extern uint8_t okcore_web_agent_derive_mode();
+
+/* Field 31 - webcrypt policy. What the browser is ALLOWED to do over the FIDO2
+ * extension, as opposed to field 30's input mode (how the user confirms it).
+ *
+ * Both bits default OFF, which means: derived keys yes, stored keys (PGP) no,
+ * extension enabled. */
+#define OKWC_ALLOW_STORED_KEY  0x01  /* stored-slot OKSIGN/OKDECRYPT over FIDO2 */
+#define OKWC_DISABLE_EXT       0x02  /* no OnlyKey FIDO2 extension at all */
+#define OKWC_VALID_MASK        (OKWC_ALLOW_STORED_KEY | OKWC_DISABLE_EXT)
+#define OKWC_UNSET             0xFF  /* erased EEPROM: never configured */
+extern uint8_t okcore_webcrypt_policy();
+/* Stage the user-confirmation state (LED, challenge digits or press mode) for
+ * an operation that is already fully staged elsewhere. done_process_packets()
+ * passes the request it accumulated in packet_buffer; the derived X-Wing
+ * decaps path passes a hash over its own reassembled label||ciphertext. */
+extern void okcore_prime_user_confirmation (uint8_t opcode, uint8_t slot,
+                                            const uint8_t *msg, size_t msg_len);
 extern int large_buffer_offset;
 
 extern void okcore_flashset_2ndpinhashpublic (uint8_t *ptr);

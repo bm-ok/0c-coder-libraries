@@ -257,7 +257,6 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 	uint8_t os;
 	uint8_t temp[256];
 	uint8_t pubsize = 0;
-	extern uint8_t derived_key_challenge_mode;
 
 	memcpy(client_handle, keyh+OK_KEYHANDLE_HEADER_LEN, handle_len);
 		

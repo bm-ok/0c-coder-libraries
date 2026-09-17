@@ -81,17 +81,58 @@ void finish_SHA256(const uECC_HashContext *base, uint8_t *hash_result) {
 }
 
 int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
-    const char stored_appid[] = "\xEB\xAE\xE3\x29\x09\x0A\x5B\x51\x92\xE0\xBD\x13\x2D\x5C\x22\xC6\xD1\x8A\x4D\x23\xFC\x8E\xFD\x4A\x21\xAF\xA8\xE4\xC8\xFD\x93\x54";
+    /* ---- Trusted origins -------------------------------------------------
+     *
+     * Compiled in, on purpose. There is no list a user can add to: an origin
+     * that reaches this code gets a derivation oracle, and the one setting
+     * whose misuse would matter most is the one that hands that out.
+     *
+     * PRODUCTION: apps.crp.to and apps.onlykey.io. Both will serve the same
+     * app. onlyagent.app was here and is NOT any more - it is the staging site,
+     * and staging is tested on DEBUG firmware, which returns 2 for every origin
+     * a few lines below and so never reaches this table.
+     *
+     * Two forms per origin, because there are two things to compare against:
+     *
+     *   hash - SHA-256 of the bare rpId, no scheme and no trailing slash.
+     *          This is the rpIdHash the platform computes and hands us in
+     *          _appid; it is the authoritative check.
+     *   name - the rpId string as it appears in the CBOR request at
+     *          ctap_buffer+4, followed by 0x02, the next map key, acting as a
+     *          terminator. Weaker - it reads a raw buffer at a fixed offset
+     *          rather than an authenticated hash - but it is what has been
+     *          matching in the field, so it stays, and both origins now get it.
+     *          Giving only one of the two domains this path would mean
+     *          apps.onlykey.io failing in whatever case is the reason this
+     *          check exists at all.
+     *
+     * The name lengths differ (12 vs 16 with the terminator), which is why the
+     * comparison is driven off each entry's own length rather than a fixed 12.
+     */
+    struct trusted_origin {
+        const char *hash;   /* 32 bytes: SHA-256(rpId) */
+        const char *name;   /* rpId + 0x02 */
+        uint8_t     namelen;
+    };
+    static const struct trusted_origin trusted[] = {
+        { /* apps.crp.to */
+          "\xEB\xAE\xE3\x29\x09\x0A\x5B\x51\x92\xE0\xBD\x13\x2D\x5C\x22\xC6"
+          "\xD1\x8A\x4D\x23\xFC\x8E\xFD\x4A\x21\xAF\xA8\xE4\xC8\xFD\x93\x54",
+          "\x61\x70\x70\x73\x2E\x63\x72\x70\x2E\x74\x6F\x02", 12 },
+        { /* apps.onlykey.io */
+          "\xAE\x3C\x14\xA6\x10\xDE\xE7\xC1\x61\x1C\x8B\xDC\xE6\x53\x70\x5E"
+          "\x43\xB5\x4D\x08\x9D\x25\x31\x7C\x94\x2C\xF0\x51\x69\xDC\xC7\xAA",
+          "\x61\x70\x70\x73\x2E\x6F\x6E\x6C\x79\x6B\x65\x79\x2E\x69\x6F\x02", 16 },
+    };
+    #define TRUSTED_ORIGIN_COUNT ((int)(sizeof(trusted)/sizeof(trusted[0])))
+    #define TRUSTED_NAME_MAX 16
+
     //const char stored_appid_u2f[] = "\x23\xCD\xF4\x07\xFD\x90\x4F\xEE\x8B\x96\x40\x08\xB0\x49\xC5\x5E\xA8\x81\x13\x36\xA3\xA5\x17\x1B\x58\xD6\x6A\xEC\xF3\x79\xE7\x4A";
     //const char stored_clientDataHash[] = "\x57\x81\xAF\x14\xB9\x71\x6D\x87\x24\x61\x8E\x8A\x6F\xD6\x50\xEB\x6B\x02\x6B\xEC\x6B\xAD\xB3\xB1\xA3\x01\xAA\x0D\x75\xF6\x0C\x14";
     //const char stored_clientDataHash_u2f[] = "\x78\x4E\x39\xF2\xDA\xF8\xE6\xA4\xBB\xD7\x15\x0D\x39\x34\xCC\x81\x5F\x6E\xE7\x6F\x57\xBC\x02\x6A\x0E\x49\x33\x13\xF4\x36\x63\x47"; 
-    const char stored_apprpid[] = "\x61\x70\x70\x73\x2E\x63\x72\x70\x2E\x74\x6F\x02"; //apps.crp.to + 0x02 teminating character
-    const char stored_appid_oa[] = "\xB8\xAA\xE5\x9C\x19\xDE\x59\x2A\xDB\xF1\xCA\x0A\x15\xC0\x03\x15\x88\x98\x8B\x61\x44\xFA\xA7\xC2\xE1\xC4\x30\x34\xC1\x66\xD5\x83"; //SHA256("onlyagent.app") - OnlyAgent origin
-	uint8_t rpid[12];
-    int appid_match1;
-	int appid_match2;
+	uint8_t rpid[TRUSTED_NAME_MAX];
     extern uint8_t ctap_buffer[CTAPHID_BUFFER_SIZE];
-    memcpy(rpid, ctap_buffer+4, 12); 
+    memcpy(rpid, ctap_buffer+4, TRUSTED_NAME_MAX);
     // Read the policy byte from EEPROM rather than trusting any RAM copy. The
     // RAM copies of the mode bytes are unconditionally zeroed by wipetasks()
     // and by every done_process_packets() call (the raw-HID pipeline: PIN
@@ -111,29 +152,33 @@ int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
     #ifdef DEBUG
 	Serial.println("Ctap buffer:");
     byteprint(ctap_buffer, 12);
-	Serial.println("stored_apprpid:");
-    byteprint((uint8_t*)stored_apprpid, 12);
-    Serial.println("rpid:");
-    byteprint((uint8_t*)rpid, 12);
-	Serial.println("stored_appid:");
-    byteprint((uint8_t*)stored_appid, 32);
-	Serial.println("_appid:");
+	Serial.println("rpid seen:");
+    byteprint((uint8_t*)rpid, TRUSTED_NAME_MAX);
+	Serial.println("_appid seen:");
     byteprint(_appid, 32);
+    for (int t = 0; t < TRUSTED_ORIGIN_COUNT; t++) {
+        Serial.print("trusted origin ");
+        Serial.print(t);
+        Serial.println(" name/hash:");
+        byteprint((uint8_t*)trusted[t].name, trusted[t].namelen);
+        byteprint((uint8_t*)trusted[t].hash, 32);
+    }
     return 2; // Trust all origins for debug firmware
 	#endif
     
-    appid_match1 = memcmp (stored_apprpid, rpid, 12);
-	appid_match2 = memcmp (stored_appid, _appid, 32);
-	int appid_match3 = memcmp (stored_appid_oa, _appid, 32); //OnlyAgent origin (onlyagent.app)
-    if ((appid_match1 == 0 || appid_match2 == 0 || appid_match3 == 0) &&
-        !(wc_policy & OKWC_DISABLE_EXT)) {
+    int origin_ok = 0;
+    for (int t = 0; t < TRUSTED_ORIGIN_COUNT && !origin_ok; t++) {
+        if (memcmp(trusted[t].hash, _appid, 32) == 0) origin_ok = 1;
+        else if (memcmp(trusted[t].name, rpid, trusted[t].namelen) == 0) origin_ok = 1;
+    }
+    if (origin_ok && !(wc_policy & OKWC_DISABLE_EXT)) {
         // A trusted origin gets DERIVED-KEY access only (return 1) unless the
         // user has explicitly opted in to stored-key operations over FIDO2.
         // Level 2 is what unlocks the OKDECRYPT/OKSIGN tunnel in
         // ok_extension.cpp, i.e. PGP and any other operation against a REAL
         // slot, with the slot number chosen by the caller. "Caller" here is
         // Webcrypt - the OnlyKey web app - not a web page in general: the
-        // origins that reach this code are the three compiled in above, and
+        // origins that reach this code are the two compiled in above, and
         // there is no list a user can add to.
         //
         // This used to return 2 unconditionally, so every trusted origin could
@@ -146,11 +191,11 @@ int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
         return (wc_policy & OKWC_ALLOW_STORED_KEY) ? 2 : 1;
     }
     // The old bit 2 escape hatch is GONE. It let an origin that matches NONE of
-    // the three hardcoded appids above through at level 1 as long as the
+    // the hardcoded origins above through at level 1 as long as the
     // message was an OKCONNECT. The allowed origins are compiled into this
     // function on purpose; a user-settable bypass of that list is not a setting
     // anyone needs, and it is the one setting whose misuse hands an arbitrary
-    // arbitrary origin a derivation oracle.
+    // origin a derivation oracle.
     else return 0;
 }
 

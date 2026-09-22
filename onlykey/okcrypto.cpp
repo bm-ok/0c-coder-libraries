@@ -251,9 +251,11 @@ void okcrypto_sign (uint8_t *buffer) {
 //
 // Construction, in two clearly separated layers:
 //
-//   1. HKDF (RFC 5869, HMAC-SHA256) turns the device secret, the label and the
-//      origin into ONE 32-byte X-Wing seed. This is the only place HKDF
-//      appears and the only OnlyKey-specific step.
+//   1. HKDF (RFC 5869, HMAC-SHA256) turns the device secret and the label
+//      into ONE 32-byte X-Wing seed - no origin, see above. This is the only
+//      place HKDF appears and the only OnlyKey-specific step. Both halves
+//      below come from this seed, so the X25519 half is exactly as
+//      origin-free as the ML-KEM half.
 //   2. That seed goes through the X-Wing spec's own key generation -
 //      xwing_shake256(expanded, 96, seed, 32), ML-KEM d||z = expanded[0:64],
 //      sk_X = expanded[64:96] - the SAME call and layout the stored-slot path

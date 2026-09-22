@@ -646,6 +646,14 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 					#ifdef DEBUG
 					Serial.println("Stored-key operations over FIDO2 are disabled");
 					#endif
+					// outputmode is DISCARD here (set at the top of this block),
+					// and send_transport_response() has no DISCARD branch, so
+					// without this the refusal went nowhere: not to the browser,
+					// not to the vendor interface. The web app saw an empty
+					// response and timed out instead of telling the user which
+					// setting to change. Same pattern as the transit-auth and
+					// OKPING errors above.
+					outputmode = WEBAUTHN;
 					hidprint("Error stored key use over FIDO2 not enabled");
 					ret = send_stored_response(output, opt3);
 					return ret;

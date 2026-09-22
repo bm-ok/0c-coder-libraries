@@ -166,9 +166,26 @@ int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
     return 2; // Trust all origins for debug firmware
 	#endif
     
+    /* _appid IS NULL ON ONE OF THE TWO CALL PATHS, and the hash comparison has
+     * to know it. ctap.cpp's add_existing_user_info() calls
+     * webcryptcheck(NULL, NULL) for every allowList credential of every FIDO2
+     * getAssertion - ordinary logins on ordinary websites included - to decide
+     * whether to look the credential up among resident keys. The DEBUG block
+     * above returns before this line, so no DEBUG build ever executed it; the
+     * first production-configuration run (01-protocol/29-webcrypt-policy on an
+     * enforcing emulator, 2026-09-22) segfaulted here, on the very first
+     * request, at `memcmp(trusted[t].hash, NULL, 32)`.
+     *
+     * On a Teensy the same read does not fault - flash is mapped at 0x0 - so it
+     * compared the trusted hashes against the vector table, never matched, and
+     * fell through to the name comparison, which reads ctap_buffer and is what
+     * actually decided. Correct by accident on the device, undefined behaviour
+     * in C, and a hard crash on anything that does not map address zero. The
+     * name comparison is the answer on this path, so skip the hash when there
+     * is no hash to compare. */
     int origin_ok = 0;
     for (int t = 0; t < TRUSTED_ORIGIN_COUNT && !origin_ok; t++) {
-        if (memcmp(trusted[t].hash, _appid, 32) == 0) origin_ok = 1;
+        if (_appid && memcmp(trusted[t].hash, _appid, 32) == 0) origin_ok = 1;
         else if (memcmp(trusted[t].name, rpid, trusted[t].namelen) == 0) origin_ok = 1;
     }
     if (origin_ok && !(wc_policy & OKWC_DISABLE_EXT)) {

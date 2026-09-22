@@ -810,6 +810,28 @@ void okcrypto_generate_random_key (uint8_t *buffer) {
 		} else if ((buffer[6] & 0x0F) == 3) {
 			const struct uECC_Curve_t * curve = uECC_secp256k1();
 			uECC_make_key(ecc_public_key, buffer+7, curve);
+		} else if ((buffer[6] & 0x0F) == KEYTYPE_CURVE25519) {
+			/* THIS BRANCH WAS MISSING, and its absence was silent. The CLI's
+			 * genkey accepts 'c' and CLI_KEY_LETTERS maps it to
+			 * KEYTYPE_CURVE25519 (4), so the all-FFs trigger arrived here,
+			 * matched nothing, and fell through - leaving ecc_priv_flash() to
+			 * store the thirty-two 0xFF trigger bytes AS THE PRIVATE KEY. Every
+			 * device that ran it got the same key, and its public half is a
+			 * published constant. Measured on the emulator: two generations in
+			 * a row answered 210142ed5157ad3d1b58074fa3e9f077710a6a9d..., and
+			 * the other three types answered differently every time.
+			 *
+			 * Thirty-two random bytes is the whole keygen here. Unlike P-256
+			 * and secp256k1 - where uECC_make_key() exists because a random 32
+			 * bytes can land at or above the group order - every 32-bit string
+			 * is a valid X25519 scalar, and okcrypto_compute_pubkey() clamps on
+			 * the way out. The byte-swap that same function applies for this
+			 * type (the GnuPG ordering) does not matter to random bytes either.
+			 *
+			 * ecc_public_key is not computed because nothing reads it: the line
+			 * below wipes it, and OKGETPUBKEY recomputes from the stored scalar
+			 * after a flashget. */
+			RNG2(buffer + 7, 32);
 		}
 		memset(ecc_public_key, 0, sizeof(ecc_public_key));
 	}
@@ -2396,10 +2418,21 @@ void okcrypto_mlkem_keygen (uint8_t *buffer) {
 	Serial.println();
 	Serial.println("MLKEM KEYGEN MESSAGE RECEIVED");
 	#endif
-	if (!CRYPTO_AUTH && !configmode) {
-		pending_operation=CTAP2_ERR_USER_ACTION_PENDING;
-		return;
-	}
+	/* NO CONFIRMATION GATE HERE, and the reason is where this can be reached
+	 * from. A keygen only ever arrives through OKSETPRIV, which okcore.cpp
+	 * dispatches on `configmode == true || !initcheck` - config mode, or first
+	 * use. Both are presence proofs already: config mode is entered by a long
+	 * press on the device and cannot be left without a reinsert, and first use
+	 * is the provisioning the user is physically performing. A 3-button
+	 * challenge on top of either is unanswerable anyway, because the
+	 * config-mode LED owns the indicator.
+	 *
+	 * This used to carry `if (!CRYPTO_AUTH && !configmode) { pending; return; }`
+	 * by analogy with the decaps functions. The analogy does not hold: decaps
+	 * IS reachable from a normal unlocked device, so its gate is real, and this
+	 * one could only ever fire during first-use provisioning - where it would
+	 * have stalled setup waiting for a challenge. ECC keygen has never had one.
+	 */
 
 	// Generate 32-byte seed, store via existing ECC slot infrastructure
 	// buffer[5] = slot (set by caller), buffer[6] = type, buffer[7..38] = key data
@@ -2551,10 +2584,21 @@ void okcrypto_xwing_keygen (uint8_t *buffer) {
 	Serial.println();
 	Serial.println("XWING KEYGEN MESSAGE RECEIVED");
 	#endif
-	if (!CRYPTO_AUTH && !configmode) {
-		pending_operation=CTAP2_ERR_USER_ACTION_PENDING;
-		return;
-	}
+	/* NO CONFIRMATION GATE HERE, and the reason is where this can be reached
+	 * from. A keygen only ever arrives through OKSETPRIV, which okcore.cpp
+	 * dispatches on `configmode == true || !initcheck` - config mode, or first
+	 * use. Both are presence proofs already: config mode is entered by a long
+	 * press on the device and cannot be left without a reinsert, and first use
+	 * is the provisioning the user is physically performing. A 3-button
+	 * challenge on top of either is unanswerable anyway, because the
+	 * config-mode LED owns the indicator.
+	 *
+	 * This used to carry `if (!CRYPTO_AUTH && !configmode) { pending; return; }`
+	 * by analogy with the decaps functions. The analogy does not hold: decaps
+	 * IS reachable from a normal unlocked device, so its gate is real, and this
+	 * one could only ever fire during first-use provisioning - where it would
+	 * have stalled setup waiting for a challenge. ECC keygen has never had one.
+	 */
 
 	// Generate 32-byte seed, store via existing ECC slot infrastructure
 	uint8_t seed[XWING_SEED_SIZE];

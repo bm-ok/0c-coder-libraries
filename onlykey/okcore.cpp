@@ -5428,38 +5428,32 @@ void ecc_priv_flash(uint8_t *buffer, bool wipe, bool quiet)
 	if (gen_key == 2040)
 	{ //All FFs, trigger to generate a randomly generated key
 		uint8_t basetype = buffer[6] & 0x0F;
-		if (basetype == KEYTYPE_MLKEM768 || basetype == KEYTYPE_XWING) {
-			// PQC keygen requires an explicit button-confirmation challenge
-			// first, same pattern as decaps (okcrypto_xwing_decaps /
-			// okcrypto_mlkem_decaps): prime the 3-button challenge via
-			// process_packets()/done_process_packets() and wait for
-			// CRYPTO_AUTH to reach 4 (set by the button-press handler in
-			// OnlyKey.ino) before actually generating anything. Without
-			// this gate, okcrypto_xwing_keygen()/okcrypto_mlkem_keygen()'s
-			// own `if (!CRYPTO_AUTH)` check can never be satisfied - CRYPTO_AUTH
-			// is otherwise only ever primed by the decaps functions, for their
-			// own unrelated operations.
-			// Keys can only be loaded in config mode, and the device cannot be
-			// used while in config mode (leaving it means a physical
-			// remove/reinsert), so config mode IS the presence proof - and the
-			// button challenge cannot be completed there anyway (the config-mode
-			// LED owns the indicator). Only prime the challenge on first use.
-			if (!CRYPTO_AUTH && !configmode) {
-				uint8_t primebuf[64];
-				memset(primebuf, 0, 64);
-				primebuf[4] = buffer[4];
-				primebuf[5] = buffer[5];
-				primebuf[6] = 9; // final-packet length: 1 (keytype) + 8 (trigger bytes)
-				primebuf[7] = buffer[6];
-				memcpy(primebuf + 8, buffer + 7, 8);
-				process_packets(primebuf, 0, 0);
-				pending_operation = CTAP2_ERR_USER_ACTION_PENDING;
-				return;
-			} else if (CRYPTO_AUTH != 4 && !configmode) {
-				return; // challenge in progress, ignore re-entrant triggers
-			}
-			// CRYPTO_AUTH==4: confirmed via the 3-button challenge, proceed.
-		}
+		/* PQC KEYGEN CONFIRMS THE SAME WAY ECC KEYGEN DOES: it does not.
+		 *
+		 * This used to prime a 3-button challenge for KEYTYPE_MLKEM768 and
+		 * KEYTYPE_XWING and return, waiting for CRYPTO_AUTH to reach 4, by
+		 * analogy with okcrypto_mlkem_decaps()/okcrypto_xwing_decaps(). The
+		 * analogy does not hold, and the gate was unreachable where it mattered
+		 * and harmful where it was not:
+		 *
+		 *   - A keygen only ever arrives through OKSETPRIV, which okcore.cpp
+		 *     dispatches on `configmode == true || !initcheck`. Decaps is
+		 *     reachable from a normal unlocked device; a keygen is not.
+		 *   - In config mode the gate short-circuited on `&& !configmode`, so it
+		 *     never fired on the path every host actually uses.
+		 *   - On FIRST USE, where configmode is false, it DID fire - stalling
+		 *     provisioning on a challenge that cannot be answered, because the
+		 *     config-mode/setup indicator owns the LED.
+		 *
+		 * Both reachable states are already presence proofs: config mode is
+		 * entered by a long press and left only by a reinsert, and first use is
+		 * the provisioning the user is physically performing. Generating an
+		 * ML-KEM or X-Wing seed is now exactly what generating a Curve25519 or
+		 * P-256 key has always been.
+		 *
+		 * The confirmed-keygen re-entry in okcore_run_pending_op() went with it;
+		 * nothing else ever set packet_buffer_details[0] to OKSETPRIV. */
+		(void)basetype;
 		okcrypto_generate_random_key(buffer);
 		if (basetype == KEYTYPE_MLKEM768 || basetype == KEYTYPE_XWING) {
 			// The PQC keygens STORE THE SEED THEMSELVES and must not fall
@@ -6272,18 +6266,11 @@ void okcore_run_pending_op() {
 			recvmsg(0);
 		}
 		u2f_button = 0;
-	} else if (packet_buffer_details[0] == OKSETPRIV) {
-		// PQC (X-Wing/ML-KEM) keygen confirmation: ecc_priv_flash() primed this
-		// via process_packets(), which encrypted the [keytype, 0xFF x8] trigger
-		// into large_buffer - decrypt it back, rebuild recv_buffer in the layout
-		// set_private()/ecc_priv_flash() expect, and re-run now that CRYPTO_AUTH==4.
-		okcore_aes_gcm_decrypt(large_buffer, packet_buffer_details[0], packet_buffer_details[1], profilekey, large_buffer_offset);
-		recv_buffer[4] = packet_buffer_details[0];
-		recv_buffer[5] = packet_buffer_details[1];
-		recv_buffer[6] = large_buffer[0];
-		memcpy(recv_buffer + 7, large_buffer + 1, large_buffer_offset - 1);
-		set_private(recv_buffer);
 	}
+	/* There was an OKSETPRIV arm here, re-running a PQC keygen after its
+	 * 3-button challenge. ecc_priv_flash() no longer primes that challenge - see
+	 * the comment there - and nothing else ever set packet_buffer_details[0] to
+	 * OKSETPRIV, so this could not be reached. */
 	CRYPTO_AUTH = 0;
 	user_input_mode = USER_INPUT_CHALLENGE;
 	pending_op_no_press = 0;

@@ -236,10 +236,18 @@ void okcrypto_sign (uint8_t *buffer) {
 // ---- Derived (label-based) X-Wing over HID and FIDO2 --------------------
 //
 // Nothing is stored: the keypair is reproduced on demand from
-// (slot-128 web-and-agent derivation key, 32-byte label tag, origin). Origin is
-// pinned to
-// "onlyagent.app" so the CLI and the web app derive the same key; both hash the
-// label the same way (SHA256(utf8(label))).
+// (slot-128 web-and-agent derivation key, 32-byte label tag). There is NO origin
+// in the derivation, and that is deliberate: the CLI (raw HID, no origin at all)
+// and every web origin must reach the same key for a label, so a file encrypted
+// in the browser decrypts with the age plugin and vice versa. Both hash the label
+// the same way (SHA256(utf8(label))).
+//
+// This used to hash a pinned string, "onlyagent.app", into the HKDF info and
+// call it origin binding. It was never origin binding - it was the same constant
+// for every caller - and it tied the key to a site that is not a production
+// origin. v3 drops it; the info string alone is the domain separation. Web-
+// derived ECC keys (okcrypto_hkdf) are different: those ARE bound to the
+// browser's rpId, and stay that way.
 //
 // Construction, in two clearly separated layers:
 //
@@ -266,7 +274,7 @@ void okcrypto_sign (uint8_t *buffer) {
 //   derive decaps    : out = [ ss(32) ]                = X-Wing shared secret
 //
 // The RPID staging is gone too: okcrypto_hkdf() reads its info string out of
-// ctap_buffer+4, so this code used to write "onlyagent.app" there before
+// ctap_buffer+4, so this code used to write a fixed origin string there before
 // deriving - and a FIDO2 path that did NOT stage it derived a different sk_X
 // than the CLI for the same label (ok_extension.cpp:280 documents that hunt).
 // okcrypto_hkdf_expand() takes info as an argument, so the shared mutable
@@ -297,18 +305,15 @@ void okcrypto_hkdf_expand (const uint8_t *prk, const uint8_t *info, size_t info_
 	memset(T, 0, sizeof(T));
 }
 
-/* (slot-128 key, label, origin) -> one 32-byte X-Wing seed.
+/* (slot-128 key, label) -> one 32-byte X-Wing seed.
  * 32 and not 64 on purpose: X-Wing's decapsulation key IS 32 bytes; the 64-byte
  * quantity is ML-KEM's own d||z, which the spec expansion produces FROM it. */
 void okcrypto_xwing_derive_seed (const uint8_t *label32, uint8_t *seed_out) {
-	static const char RPID[] = "onlyagent.app";
-	static const char INFO[] = "onlykey/xwing/seed/v2";
-
-	uint8_t rpid_hash[32];
-	SHA256_CTX rc;
-	sha256_init(&rc);
-	sha256_update(&rc, (const uint8_t *)RPID, sizeof(RPID) - 1);
-	sha256_final(&rc, rpid_hash);
+	/* v3: the info string is the whole domain separation. v2 prefixed it with
+	 * SHA256("onlyagent.app"), a constant every caller shared - see the block
+	 * comment above. Changing it moved every derived X-Wing recipient, which was
+	 * free to do only because derived X-Wing had never shipped. */
+	static const char INFO[] = "onlykey/xwing/seed/v3";
 
 	uint8_t salt[33] = {0};                        /* [flag 0][label32] */
 	memcpy(salt + 1, label32, 32);
@@ -321,10 +326,7 @@ void okcrypto_xwing_derive_seed (const uint8_t *label32, uint8_t *seed_out) {
 	h.update(ecc_private_key, 32);
 	h.finalizeHMAC(salt, sizeof(salt), prk, 32);
 
-	uint8_t info[32 + sizeof(INFO) - 1];
-	memcpy(info, rpid_hash, 32);                   /* origin binding */
-	memcpy(info + 32, INFO, sizeof(INFO) - 1);
-	okcrypto_hkdf_expand(prk, info, sizeof(info), seed_out, 32);
+	okcrypto_hkdf_expand(prk, (const uint8_t *)INFO, sizeof(INFO) - 1, seed_out, 32);
 
 	#ifdef DEBUG
 	Serial.println();
@@ -336,7 +338,6 @@ void okcrypto_xwing_derive_seed (const uint8_t *label32, uint8_t *seed_out) {
 
 	memset(prk, 0, sizeof(prk));
 	memset(salt, 0, sizeof(salt));
-	memset(info, 0, sizeof(info));
 	memset(ecc_private_key, 0, sizeof(ecc_private_key));
 }
 

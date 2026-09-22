@@ -87,10 +87,11 @@ int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
      * that reaches this code gets a derivation oracle, and the one setting
      * whose misuse would matter most is the one that hands that out.
      *
-     * PRODUCTION: apps.crp.to and apps.onlykey.io. Both will serve the same
-     * app. onlyagent.app was here and is NOT any more - it is the staging site,
-     * and staging is tested on DEBUG firmware, which returns 2 for every origin
-     * a few lines below and so never reaches this table.
+     * PRODUCTION: apps.crp.to and apps.onlykey.io, and nothing else. apps.crp.to
+     * is the only origin v3.0.4 and earlier trust, so it stays as the front door
+     * for old keys; apps.onlykey.io is the new app. A staging origin is not in
+     * this table and must not be: staging is tested on DEBUG firmware, which
+     * returns 2 for every origin a few lines below and never reaches it.
      *
      * Two forms per origin, because there are two things to compare against:
      *
@@ -212,7 +213,11 @@ int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
     // message was an OKCONNECT. The allowed origins are compiled into this
     // function on purpose; a user-settable bypass of that list is not a setting
     // anyone needs, and it is the one setting whose misuse hands an arbitrary
-    // origin a derivation oracle.
+    // origin a derivation oracle. Since derivation stopped mixing in the origin
+    // (okcrypto_hkdf v2, X-Wing seed v3), that oracle would hand out the SAME
+    // keys apps.onlykey.io gets for a label: this table is the whole boundary
+    // between sites now, so anything added to it is trusted with every derived
+    // key on the device.
     else return 0;
 }
 

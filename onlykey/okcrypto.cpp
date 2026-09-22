@@ -236,16 +236,25 @@ void okcrypto_sign (uint8_t *buffer) {
 // ---- Derived (label-based) X-Wing over HID and FIDO2 --------------------
 //
 // Nothing is stored: the keypair is reproduced on demand from
-// (slot-128 web-and-agent derivation key, 32-byte label tag, origin). Origin is
-// pinned to
-// "onlyagent.app" so the CLI and the web app derive the same key; both hash the
-// label the same way (SHA256(utf8(label))).
+// (slot-128 web-and-agent derivation key, 32-byte label tag). There is NO origin
+// in the derivation, and that is deliberate: the CLI (raw HID, no origin at all)
+// and every web origin must reach the same key for a label, so a file encrypted
+// in the browser decrypts with the age plugin and vice versa. Both hash the label
+// the same way (SHA256(utf8(label))).
+//
+// This used to hash a pinned string, "onlyagent.app", into the HKDF info and
+// call it origin binding. It was never origin binding - it was the same constant
+// for every caller - and it tied the key to a site that is not a production
+// origin. v3 drops it; the info string alone is the domain separation. Web-
+// derived ECC keys (okcrypto_hkdf) dropped their origin too, in their v2.
 //
 // Construction, in two clearly separated layers:
 //
-//   1. HKDF (RFC 5869, HMAC-SHA256) turns the device secret, the label and the
-//      origin into ONE 32-byte X-Wing seed. This is the only place HKDF
-//      appears and the only OnlyKey-specific step.
+//   1. HKDF (RFC 5869, HMAC-SHA256) turns the device secret and the label
+//      into ONE 32-byte X-Wing seed - no origin, see above. This is the only
+//      place HKDF appears and the only OnlyKey-specific step. Both halves
+//      below come from this seed, so the X25519 half is exactly as
+//      origin-free as the ML-KEM half.
 //   2. That seed goes through the X-Wing spec's own key generation -
 //      xwing_shake256(expanded, 96, seed, 32), ML-KEM d||z = expanded[0:64],
 //      sk_X = expanded[64:96] - the SAME call and layout the stored-slot path
@@ -265,17 +274,16 @@ void okcrypto_sign (uint8_t *buffer) {
 //   derive getpubkey : out = [ pk_M(1184) | pk_X(32) ] = XWING_PK_SIZE, public
 //   derive decaps    : out = [ ss(32) ]                = X-Wing shared secret
 //
-// The RPID staging is gone too: okcrypto_hkdf() reads its info string out of
-// ctap_buffer+4, so this code used to write "onlyagent.app" there before
+// The RPID staging is gone too: okcrypto_hkdf() v1 read its info string out of
+// ctap_buffer+4 (v2 no longer does), so this code used to write a fixed origin string there before
 // deriving - and a FIDO2 path that did NOT stage it derived a different sk_X
 // than the CLI for the same label (ok_extension.cpp:280 documents that hunt).
 // okcrypto_hkdf_expand() takes info as an argument, so the shared mutable
 // buffer is out of the derivation entirely.
 
-/* HKDF-Expand, RFC 5869 section 2.3, with an explicit info string.
- * okcrypto_hkdf() hardwires info to SHA256(RPID) read from ctap_buffer and is
- * deliberately left untouched: the P-256 / Curve25519 / NACL web-and-agent
- * keytypes share it, and any change there moves keys that already exist. */
+/* HKDF-Expand, RFC 5869 section 2.3, with an explicit info string. Shared by
+ * derived X-Wing ("onlykey/xwing/seed/v3") and the web-and-agent ECC keys in
+ * okcrypto_hkdf() ("onlykey/derive/ecc/v2"). */
 void okcrypto_hkdf_expand (const uint8_t *prk, const uint8_t *info, size_t info_len,
                            uint8_t *out, size_t L) {
 	SHA256 hash;
@@ -297,18 +305,15 @@ void okcrypto_hkdf_expand (const uint8_t *prk, const uint8_t *info, size_t info_
 	memset(T, 0, sizeof(T));
 }
 
-/* (slot-128 key, label, origin) -> one 32-byte X-Wing seed.
+/* (slot-128 key, label) -> one 32-byte X-Wing seed.
  * 32 and not 64 on purpose: X-Wing's decapsulation key IS 32 bytes; the 64-byte
  * quantity is ML-KEM's own d||z, which the spec expansion produces FROM it. */
 void okcrypto_xwing_derive_seed (const uint8_t *label32, uint8_t *seed_out) {
-	static const char RPID[] = "onlyagent.app";
-	static const char INFO[] = "onlykey/xwing/seed/v2";
-
-	uint8_t rpid_hash[32];
-	SHA256_CTX rc;
-	sha256_init(&rc);
-	sha256_update(&rc, (const uint8_t *)RPID, sizeof(RPID) - 1);
-	sha256_final(&rc, rpid_hash);
+	/* v3: the info string is the whole domain separation. v2 prefixed it with
+	 * SHA256("onlyagent.app"), a constant every caller shared - see the block
+	 * comment above. Changing it moved every derived X-Wing recipient, which was
+	 * free to do only because derived X-Wing had never shipped. */
+	static const char INFO[] = "onlykey/xwing/seed/v3";
 
 	uint8_t salt[33] = {0};                        /* [flag 0][label32] */
 	memcpy(salt + 1, label32, 32);
@@ -321,10 +326,7 @@ void okcrypto_xwing_derive_seed (const uint8_t *label32, uint8_t *seed_out) {
 	h.update(ecc_private_key, 32);
 	h.finalizeHMAC(salt, sizeof(salt), prk, 32);
 
-	uint8_t info[32 + sizeof(INFO) - 1];
-	memcpy(info, rpid_hash, 32);                   /* origin binding */
-	memcpy(info + 32, INFO, sizeof(INFO) - 1);
-	okcrypto_hkdf_expand(prk, info, sizeof(info), seed_out, 32);
+	okcrypto_hkdf_expand(prk, (const uint8_t *)INFO, sizeof(INFO) - 1, seed_out, 32);
 
 	#ifdef DEBUG
 	Serial.println();
@@ -336,7 +338,6 @@ void okcrypto_xwing_derive_seed (const uint8_t *label32, uint8_t *seed_out) {
 
 	memset(prk, 0, sizeof(prk));
 	memset(salt, 0, sizeof(salt));
-	memset(info, 0, sizeof(info));
 	memset(ecc_private_key, 0, sizeof(ecc_private_key));
 }
 
@@ -1867,50 +1868,41 @@ int mbedtls_rand( void *rng_state, unsigned char *output, size_t len ) {
 }
 
 
+/* Web-and-agent derived ECC keys (slot 128): P-256, secp256k1 and X25519 from
+ * DERIVE_PUBLIC_KEY / DERIVE_SHAREDSEC over FIDO2, and HID slots 211-214.
+ *
+ *   PRK = HMAC-SHA256(salt = additional_data [flag | tag32], IKM = slot-128 key)
+ *   key = HKDF-Expand(PRK, "onlykey/derive/ecc/v2", L)
+ *
+ * v2 has NO ORIGIN in it, for the same reason derived X-Wing (seed v3) has
+ * none: a label is meant to name one key, whichever trusted site - or host -
+ * asks for it. v1 used SHA256(rpId) as the HKDF info, read out of ctap_buffer+4
+ * by scanning to the CBOR 0x02 that follows the rpId. That bound every key to
+ * the browser origin (apps.crp.to and apps.onlykey.io got different keys for
+ * one label), and it made the HID route (211-214) worse than origin-bound:
+ * ctap_buffer holds whatever the LAST FIDO2 request left there, or zeros after
+ * boot, so a HID-derived key depended on unrelated earlier traffic. Changing it
+ * moves every web-derived ECC key, which was free to do only because no shipped
+ * web app used them (the 2022 apps.crp.to app has no derive page).
+ *
+ * Which sites can ask at all is webcryptcheck()'s job, and only its job now:
+ * with no origin in the derivation, every origin in the trusted table - and
+ * every origin, on a DEBUG build - derives the same key for a label.
+ *
+ * The info string also separates these keys from derived X-Wing: for a flag-0
+ * request the salt [0 | tag] is the same one okcrypto_xwing_derive_seed() uses,
+ * so the PRK is identical and the info string is what keeps the outputs apart. */
 void okcrypto_hkdf(const void *salt, const void *inputKey, void *outputKey, const size_t L) {
-	SHA256 hash;
-	uint8_t PRK[hash.hashSize()];
-	void *s;
-	// 33, not 32: the salt this function is called with is the 33-byte
-	// additional_data ([flag][32-byte tag]), and the salt == NULL branch below
-	// zero-fills and then HMAC-keys 33 bytes from here. At 32 that wrote one
-	// byte past the end of this buffer and read one byte past it as key
-	// material. Unreachable today - okcrypto_derive_key(), the only caller,
-	// always passes a non-NULL 33-byte salt - but the trap was live for the
-	// next caller. Sized off the salt length rather than the hash length on
-	// purpose; they are not the same quantity.
+	static const char INFO[] = "onlykey/derive/ecc/v2";
+	// 33, not 32: the salt is the 33-byte additional_data ([flag][32-byte tag]),
+	// and the salt == NULL branch zero-fills and HMAC-keys 33 bytes from here.
 	uint8_t tmp[33];
-	int N = L / hash.hashSize();
-	int i = 0;
-	uint8_t rpid[255] ={0};
-	extern uint8_t ctap_buffer[CTAPHID_BUFFER_SIZE];
-	uint8_t *ptr = ctap_buffer+4;
-	while (*ptr != 0x02 && i < (int)sizeof(rpid)) {
-		rpid[i] = *ptr;
-		i++;
-		ptr++;
-	}
-
-	#ifdef DEBUG
-	Serial.print ("RPID");
-	byteprint(rpid,i);
-	#endif
-
-	SHA256_CTX context;
-	sha256_init(&context);
-	sha256_update(&context, rpid, i);
-	sha256_final(&context, rpid);
-
-	#ifdef DEBUG
-	Serial.print ("RPID hash");
-	byteprint(rpid,32);
-	#endif
-
+	const uint8_t *s;
 	if (salt == NULL) {
+		memset(tmp, 0, sizeof(tmp));
 		s = tmp;
-		memset(s, 0, sizeof(tmp));
 	} else {
-		s = (void *) salt;
+		s = (const uint8_t *) salt;
 	}
 
 	#ifdef DEBUG
@@ -1918,54 +1910,15 @@ void okcrypto_hkdf(const void *salt, const void *inputKey, void *outputKey, cons
 	byteprint((uint8_t*)s,33);
 	#endif
 
-
+	SHA256 hash;                                   /* HKDF-Extract, RFC 5869 2.2 */
+	uint8_t PRK[32];
 	hash.resetHMAC(s, 33);
 	hash.update(inputKey, 32);
-	hash.finalizeHMAC(s, 33, PRK, hash.hashSize());
+	hash.finalizeHMAC(s, 33, PRK, sizeof(PRK));
+	hash.clear();
 
-	// Use rpid as tsalt
-	size_t saltLen = hash.hashSize() + 32 + 1;
-	uint8_t tsalt[saltLen];
-	tsalt[saltLen - 1] = 1;
-	memcpy(tsalt + hash.hashSize(), rpid, 32);
-
-	// Calculate T(1)
-	hash.resetHMAC (PRK, hash.hashSize());
-	hash.update(tsalt + hash.hashSize(), 32 + 1);
-	hash.finalizeHMAC (PRK, hash.hashSize(), outputKey, hash.hashSize());
-
-	tsalt[saltLen - 1] += 1;
-	memcpy(tsalt, outputKey, hash.hashSize());
-
-	// Calculate T(2) ... T(N)
-	for (i = 1; i < N; i++) {
-		hash.resetHMAC(PRK, hash.hashSize());
-		hash.update(tsalt, saltLen);
-		hash.finalizeHMAC(PRK,
-					hash.hashSize(),
-					((uint8_t *) outputKey) + (i * hash.hashSize()),
-					hash.hashSize());
-
-		tsalt[saltLen - 1] += 1;
-		memcpy(tsalt,
-			((uint8_t *) outputKey) + (i * hash.hashSize()),
-			hash.hashSize());
-	}
-
-	// Process remaining octets if there are any.
-	if (L % hash.hashSize()) {
-		uint8_t rslt[hash.hashSize()];
-		int remain = L - N * hash.hashSize();
-		hash.resetHMAC(PRK, hash.hashSize());
-		hash.update(tsalt, saltLen);
-		hash.finalizeHMAC(PRK, hash.hashSize(), rslt, hash.hashSize());
-
-		memcpy(((uint8_t *) outputKey) + (N * hash.hashSize()),
-			rslt,
-			remain);
-	}
-		hash.clear();
-
+	okcrypto_hkdf_expand(PRK, (const uint8_t *)INFO, sizeof(INFO) - 1, (uint8_t *)outputKey, L);
+	memset(PRK, 0, sizeof(PRK));
 }
 
 

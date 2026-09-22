@@ -331,8 +331,9 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 			// OnlyKey Private Web (beta)
 			// This is a simple way of providing web apps with a shared secret
 			// for use in encryption/signing. This shared secret is derived
-			// based on input public key, domain (origin) and allowing  
-			// additional data as input to private derivation (HKDF). Key types supported 
+			// based on input public key and the caller's 32-byte label tag
+			// (HKDF). The origin is NOT an input - okcrypto_hkdf() v2 - so every
+			// trusted origin gets the same key for a label. Key types supported 
 			// include NACL, P256R1, P256K1, and Curve25519. No user presence is 
 			// required making this useful for encrypted/private web pages that may
 			// be decrypted and viewed only when OnlyKey is connected and unlocked.

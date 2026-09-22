@@ -196,7 +196,11 @@ int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
     // message was an OKCONNECT. The allowed origins are compiled into this
     // function on purpose; a user-settable bypass of that list is not a setting
     // anyone needs, and it is the one setting whose misuse hands an arbitrary
-    // origin a derivation oracle.
+    // origin a derivation oracle. Since derivation stopped mixing in the origin
+    // (okcrypto_hkdf v2, X-Wing seed v3), that oracle would hand out the SAME
+    // keys apps.onlykey.io gets for a label: this table is the whole boundary
+    // between sites now, so anything added to it is trusted with every derived
+    // key on the device.
     else return 0;
 }
 

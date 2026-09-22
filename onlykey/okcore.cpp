@@ -5655,12 +5655,31 @@ void rsa_priv_flash(uint8_t *buffer, bool wipe)
 		Serial.println(buffer[6]);
 	#endif
 	}
+	/* EVERY CHUNK COPY IS CLAMPED TO WHAT IS LEFT OF THE KEY, not to a literal
+	 * 57. The host sends a whole 57-byte report whether or not the key ends
+	 * inside it, so the final chunk of every size carries padding the key does
+	 * not own:
+	 *
+	 *     type 1  offsets 0,57,114          last copy 14 of 57   43 bytes padding
+	 *     type 2  offsets 0..228            last copy 28 of 57   29 bytes padding
+	 *     type 3  offsets 0..342            last copy 42 of 57   15 bytes padding
+	 *     type 4  offsets 0..456            last copy 56 of 57    1 byte  padding
+	 *     PQC     offsets 0..285            last copy 35 of 57   22 bytes padding
+	 *
+	 * At 512 that one byte was an out-of-bounds WRITE - the ninth chunk starts
+	 * at 456 and a full copy reaches index 512 of a 512-byte array - and that is
+	 * what the clamp was added for. The smaller types are not out of bounds, but
+	 * they are not harmless either: the padding lands in the slot tail, which
+	 * reaches flash (see below), so it is host-controlled data stored inside a
+	 * key slot. Clamping to `keysize` fixes both and leaves the offset
+	 * progression - and therefore the wire protocol - exactly as it was. */
 	if ((buffer[6] & 0x0F) == 1) //Expect 128 Bytes, if buffer[0] != FF we know this is import from backup
 	{
 		keysize = 128;
 		if (buffer[0] != 0xBA && packet_buffer_offset <= 114)
 		{
-			memcpy(rsa_private_key + packet_buffer_offset, buffer + 7, 57);
+			int room = keysize - packet_buffer_offset;
+			memcpy(rsa_private_key + packet_buffer_offset, buffer + 7, room < 57 ? room : 57);
 			packet_buffer_offset = packet_buffer_offset + 57;
 		}
 	}
@@ -5669,7 +5688,8 @@ void rsa_priv_flash(uint8_t *buffer, bool wipe)
 		keysize = 256;
 		if (buffer[0] != 0xBA && packet_buffer_offset <= 228)
 		{
-			memcpy(rsa_private_key + packet_buffer_offset, buffer + 7, 57);
+			int room = keysize - packet_buffer_offset;
+			memcpy(rsa_private_key + packet_buffer_offset, buffer + 7, room < 57 ? room : 57);
 			packet_buffer_offset = packet_buffer_offset + 57;
 		}
 	}
@@ -5678,25 +5698,17 @@ void rsa_priv_flash(uint8_t *buffer, bool wipe)
 		keysize = 384;
 		if (buffer[0] != 0xBA && packet_buffer_offset <= 342)
 		{
-			memcpy(rsa_private_key + packet_buffer_offset, buffer + 7, 57);
+			int room = keysize - packet_buffer_offset;
+			memcpy(rsa_private_key + packet_buffer_offset, buffer + 7, room < 57 ? room : 57);
 			packet_buffer_offset = packet_buffer_offset + 57;
 		}
 	}
 	else if ((buffer[6] & 0x0F) == 4)
 	{ //Expect 512 Bytes
 		keysize = 512;
-		/* The smaller key types have slack: their last chunk starts below
-		 * keysize and the 57-byte copy spills harmlessly into the unused tail of
-		 * the 512-byte rsa_private_key. At 512 there is no tail - the ninth
-		 * chunk starts at 456 and a full 57-byte copy writes index 512, one past
-		 * MAX_RSA_KEY_SIZE, putting an attacker-controlled byte into the next
-		 * global. Tightening the guard instead would have rejected that chunk
-		 * and made 4096-bit keys unloadable, so clamp the copy to what is left
-		 * and leave the offset progression (and therefore the wire protocol)
-		 * exactly as it was. */
 		if (buffer[0] != 0xBA && packet_buffer_offset <= 456)
 		{
-			int room = MAX_RSA_KEY_SIZE - packet_buffer_offset;
+			int room = keysize - packet_buffer_offset;
 			memcpy(rsa_private_key + packet_buffer_offset, buffer + 7, room < 57 ? room : 57);
 			packet_buffer_offset = packet_buffer_offset + 57;
 		}
@@ -5706,7 +5718,8 @@ void rsa_priv_flash(uint8_t *buffer, bool wipe)
 		keysize = PQC_PGP_BLOB_LEN;
 		if (buffer[0] != 0xBA && packet_buffer_offset < PQC_PGP_BLOB_LEN)
 		{
-			memcpy(rsa_private_key + packet_buffer_offset, buffer + 7, 57);
+			int room = keysize - packet_buffer_offset;
+			memcpy(rsa_private_key + packet_buffer_offset, buffer + 7, room < 57 ? room : 57);
 			packet_buffer_offset = packet_buffer_offset + 57;
 		}
 	}
@@ -5730,6 +5743,22 @@ void rsa_priv_flash(uint8_t *buffer, bool wipe)
 		Serial.print("RSA Key value =");
 		byteprint((uint8_t *)rsa_private_key, keysize);
 		#endif
+		/* ZERO THE SLOT TAIL BEFORE THE ENCRYPT, because all MAX_RSA_KEY_SIZE
+		 * bytes of this global reach flash while only `keysize` of them are
+		 * encrypted - the loop below copies the whole 512-byte slot. Whatever
+		 * sits past `keysize` is written in the clear.
+		 *
+		 * It is not nothing. okcore_flashget_RSA() decrypts a key INTO this same
+		 * global, so after any sign or decrypt the tail holds the plaintext of
+		 * the key that operation used. Store a smaller key afterwards and the
+		 * larger one's private bytes are persisted, unencrypted, in the new
+		 * key's slot. Measured: 01-protocol/22-rsa-slot-tail loads a 2048-bit
+		 * key, READS with it, stores a 1024-bit key over it, and finds the
+		 * 2048-bit key's plaintext in flash.bin.
+		 *
+		 * This runs after the 0xBA backup-import memcpy above, which also copies
+		 * only `keysize`, so that path is covered by the same line. */
+		memset(rsa_private_key + keysize, 0, MAX_RSA_KEY_SIZE - keysize);
 		okcore_aes_gcm_encrypt(rsa_private_key, buffer[5], buffer[6], profilekey, keysize);
 		//Copy current flash contents to buffer
 		okcore_flashget_common(tptr, (unsigned long *)adr, 2048);

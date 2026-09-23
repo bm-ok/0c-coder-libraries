@@ -216,6 +216,12 @@ extern "C"
 #define MAX_RSA_KEY_SIZE 512
 #define MAX_ECC_KEY_SIZE 32
 #define RESERVED_KEY_DERIVATION 132
+// Agent (SSH/GPG) derivation v2: same slot-132 key, HKDF-SHA256 instead of the
+// v1 SHA256(K132||data). v1 = getpubkey 132 / sign-decrypt 201-204 (the
+// default everywhere, so existing identities never move); v2 = getpubkey 232 /
+// sign-decrypt 221-224 (keytype = code - 220), opt-in from the host.
+#define DERIVATION_V2_PUBKEY_CODE 232
+#define DERIVATION_V2_CODE_BASE 220
 // KEYTYPE_MLKEM768 and KEYTYPE_XWING can be stored in any ECC slot (101-132)
 #define RESERVED_KEY_DEFAULT_BACKUP 131
 #define RESERVED_KEY_HMACSHA1_1 130

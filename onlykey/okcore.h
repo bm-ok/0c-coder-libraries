@@ -349,12 +349,21 @@ extern uint8_t okcore_web_agent_derive_mode();
 /* Field 31 - webcrypt policy. What the browser is ALLOWED to do over the FIDO2
  * extension, as opposed to field 30's input mode (how the user confirms it).
  *
- * Both bits default OFF, which means: derived keys yes, stored keys (PGP) no,
- * extension enabled. */
+ * Until the field is first written, okcore_webcrypt_policy() answers as v3.0.4
+ * behaved: derived keys yes, stored keys (PGP) yes, extension enabled unless
+ * legacy field 21 bit 1 turned it off. A written byte is the whole answer:
+ * 0 = derived keys only.
+ *
+ * STORED AS (policy | OKWC_WRITTEN). "Never written" cannot be a single byte
+ * value: a new part's EEPROM reads 0xFF, but wipeEEPROM() - every factory
+ * default and every wipe on any earlier firmware - leaves 0x00, which is also
+ * policy 0. The marker bit makes both blank values read as unwritten. */
 #define OKWC_ALLOW_STORED_KEY  0x01  /* stored-slot OKSIGN/OKDECRYPT over FIDO2 */
 #define OKWC_DISABLE_EXT       0x02  /* no OnlyKey FIDO2 extension at all */
 #define OKWC_VALID_MASK        (OKWC_ALLOW_STORED_KEY | OKWC_DISABLE_EXT)
-#define OKWC_UNSET             0xFF  /* erased EEPROM: never configured */
+#define OKWC_WRITTEN           0x80  /* set on every field 31 write */
+#define OKWC_IS_WRITTEN(raw)   ((((uint8_t)(raw)) & (uint8_t)~OKWC_VALID_MASK) == OKWC_WRITTEN)
+#define OKWC_UNSET             0xFF  /* erased EEPROM (a wiped part reads 0x00 - see above) */
 extern uint8_t okcore_webcrypt_policy();
 /* Stage the user-confirmation state (LED, challenge digits or press mode) for
  * an operation that is already fully staged elsewhere. done_process_packets()

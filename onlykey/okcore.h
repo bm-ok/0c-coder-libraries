@@ -349,8 +349,10 @@ extern uint8_t okcore_web_agent_derive_mode();
 /* Field 31 - webcrypt policy. What the browser is ALLOWED to do over the FIDO2
  * extension, as opposed to field 30's input mode (how the user confirms it).
  *
- * Both bits default OFF, which means: derived keys yes, stored keys (PGP) no,
- * extension enabled. */
+ * Until the field is first written (0xFF, OKWC_UNSET) okcore_webcrypt_policy()
+ * answers as v3.0.4 behaved: derived keys yes, stored keys (PGP) yes, extension
+ * enabled unless legacy field 21 bit 1 turned it off. A written byte is the
+ * whole answer: 0 = derived keys only. */
 #define OKWC_ALLOW_STORED_KEY  0x01  /* stored-slot OKSIGN/OKDECRYPT over FIDO2 */
 #define OKWC_DISABLE_EXT       0x02  /* no OnlyKey FIDO2 extension at all */
 #define OKWC_VALID_MASK        (OKWC_ALLOW_STORED_KEY | OKWC_DISABLE_EXT)

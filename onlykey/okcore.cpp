@@ -2102,7 +2102,8 @@ void set_slot(uint8_t *buffer)
 		// extension, as opposed to field 30's how-the-user-confirms-it:
 		//   bit 0 (OKWC_ALLOW_STORED_KEY)  stored-slot OKSIGN/OKDECRYPT (PGP)
 		//   bit 1 (OKWC_DISABLE_EXT)       turn the extension off entirely
-		// Both default off: derived keys yes, PGP no, extension on.
+		// Until this is written: derived keys yes, PGP yes (as on v3.0.4),
+		// extension on (unless legacy field 21 bit 1 turned it off).
 		//
 		// Undefined bits are refused rather than masked away, so a host that
 		// means something this firmware does not understand gets an error
@@ -6182,10 +6183,15 @@ uint8_t okcore_webcrypt_policy() {
 	okeeprom_eeget_webcrypt_policy(&policy);
 	if (policy != OKWC_UNSET) return policy & OKWC_VALID_MASK;
 
+	/* Unwritten: the v3.0.4 behaviour. apps.crp.to could use stored keys (PGP)
+	 * by default there, so a key upgraded from it - and a new key, which is
+	 * also unwritten - keeps that until the user writes field 31. Writing 0
+	 * (onlykey-cli webcryptpolicy 0, or unticking the box in the App) turns
+	 * stored-key use off; the extension-off bit is still inherited below. */
 	uint8_t legacy = 0;
 	okeeprom_eeget_derived_key_challenge_mode(&legacy);
-	if (legacy == 0xFF) return 0;             /* blank key: defaults */
-	return (legacy & 0x02) ? OKWC_DISABLE_EXT : 0;
+	if (legacy == 0xFF) return OKWC_ALLOW_STORED_KEY;   /* never configured */
+	return OKWC_ALLOW_STORED_KEY | ((legacy & 0x02) ? OKWC_DISABLE_EXT : 0);
 }
 
 uint8_t okcore_web_agent_derive_mode() {

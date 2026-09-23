@@ -38,8 +38,8 @@ static uint8_t okcore_webcrypt_policy(void) {
     uint8_t policy = ee_f31;
     if (policy != OKWC_UNSET) return policy & OKWC_VALID_MASK;
     uint8_t legacy = ee_f21;
-    if (legacy == 0xFF) return 0;
-    return (legacy & 0x02) ? OKWC_DISABLE_EXT : 0;
+    if (legacy == 0xFF) return OKWC_ALLOW_STORED_KEY;
+    return OKWC_ALLOW_STORED_KEY | ((legacy & 0x02) ? OKWC_DISABLE_EXT : 0);
 }
 /* --- transcribed from device.cpp webcryptcheck() tail --- */
 static int webcrypt_level(int origin_trusted) {
@@ -52,10 +52,11 @@ static int webcrypt_level(int origin_trusted) {
 int main(void) {
     int fail = 0, n = 0;
 
-    /* 1. Blank key: every byte erased. Defaults must be derive-yes, PGP-no,
-       extension on, and a press (not "none") for web derive. */
+    /* 1. Blank key: every byte erased. Defaults must be what v3.0.4 did -
+       derive-yes, PGP-yes, extension on - and a press (not "none") for web
+       derive. (Decided 2026-09-23: upgraded keys keep web PGP.) */
     ee_f21 = ee_f22 = ee_f30 = ee_f31 = 0xFF;
-    if (webcrypt_level(1) != 1) { printf("FAIL blank: level %d != 1\n", webcrypt_level(1)); fail++; }
+    if (webcrypt_level(1) != 2) { printf("FAIL blank: level %d != 2\n", webcrypt_level(1)); fail++; }
     if (okcore_web_agent_derive_mode() != USER_INPUT_PRESS) { printf("FAIL blank: web derive mode not press\n"); fail++; }
     if (okcore_user_input_mode_for_slot(210) != USER_INPUT_CHALLENGE) { printf("FAIL blank: derived slot not challenge\n"); fail++; }
     n += 3;
@@ -72,8 +73,9 @@ int main(void) {
         if (!legacy_disabled && lvl == 0) {
             printf("FAIL legacy 0x%02X: extension wrongly disabled\n", b); fail++;
         }
-        /* A legacy byte must NEVER unlock stored-key (PGP) use. */
-        if (lvl == 2) { printf("FAIL legacy 0x%02X: granted level 2\n", b); fail++; }
+        /* Unwritten field 31 keeps v3.0.4's stored-key (PGP) use wherever the
+           extension is on: level 2, never 1. */
+        if (!legacy_disabled && lvl != 2) { printf("FAIL legacy 0x%02X: level %d, v3.0.4 allowed PGP\n", b, lvl); fail++; }
         n += 3;
     }
 

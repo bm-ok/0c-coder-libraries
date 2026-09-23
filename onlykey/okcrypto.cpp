@@ -679,6 +679,18 @@ void okcrypto_decrypt (uint8_t *buffer){
 			else          large_buffer[pos - 32] = buffer[7 + i];
 		}
 		derive_offset += n;
+		// Restart the 5-second wipe timer from THIS chunk, as process_packets()
+		// does for every other multi-packet request. fadeoff() - the end of
+		// almost every operation - arms Wipedata, and wipebuffersafter5sec()
+		// -> wipetasks() -> okcrypto_derive_reset() zeroes derive_offset. This
+		// reassembly never touched the timer, so a request that began within
+		// 5 s of the previous operation and was still streaming when it ran
+		// out lost everything before that moment, and the final report failed
+		// with "Error derived decaps payload size". Seen once in 02-cli/07 and
+		// reproduced on purpose by 01-protocol/31-derive-decaps-wipe-timer.
+		// An abandoned partial request is still wiped - 5 s after its last
+		// chunk rather than 5 s after whatever came before it.
+		wipedata();
 		if (buffer[6] == 0xFF) return;            /* more chunks coming */
 
 		if (derive_offset != derive_total) {

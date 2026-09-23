@@ -206,7 +206,7 @@ void okcrypto_sign (uint8_t *buffer) {
 		}
 		return;
 	}
-	else if (buffer[5] > 200 && buffer[5] < 205) { // SSH/GPG Derive Key
+	else if ((buffer[5] > 200 && buffer[5] < 205) || (buffer[5] > DERIVATION_V2_CODE_BASE && buffer[5] < DERIVATION_V2_CODE_BASE + 5)) { // SSH/GPG Derive Key (v1 201-204, v2 221-224)
 		okcrypto_ecdsa_eddsa(buffer);
 	} else {
 		if (buffer[5] > 100 && buffer[5] < 117) { // Keys 117 - 132 reserved
@@ -478,6 +478,9 @@ void okcrypto_getpubkey (uint8_t *buffer) {
 		}
 	} else if (buffer[5] == RESERVED_KEY_DERIVATION && buffer[6] <= KEYTYPE_CURVE25519) { // Generate key using provided data, return public
 	okcrypto_derive_key(buffer[6], buffer+7, 0);
+	send_transport_response(ecc_public_key, 64, false, false);
+	} else if (buffer[5] == DERIVATION_V2_PUBKEY_CODE && buffer[6] && buffer[6] <= KEYTYPE_CURVE25519) { // Agent derivation v2 (HKDF), same request shape as 132
+	okcrypto_derive_key(buffer[6], buffer+7, RESERVED_KEY_DERIVATION);
 	send_transport_response(ecc_public_key, 64, false, false);
 	} else if (buffer[5] == RESERVED_KEY_WEB_AGENT_DERIVATION && (buffer[6] & 0x0F) == KEYTYPE_XWING) {
 		// Derived X-Wing recipient: buffer[7..39] = 32-byte label tag.
@@ -756,7 +759,7 @@ void okcrypto_decrypt (uint8_t *buffer){
 			fadeoff(0);
 			return;
 		}
-	} else if (buffer[5] > 200 && buffer[5] < 205) { // SSH/GPG Derive Key
+	} else if ((buffer[5] > 200 && buffer[5] < 205) || (buffer[5] > DERIVATION_V2_CODE_BASE && buffer[5] < DERIVATION_V2_CODE_BASE + 5)) { // SSH/GPG Derive Key (v1 201-204, v2 221-224)
 		okcrypto_ecdh(buffer);
 	} else {
 		if (buffer[5] > 100 && buffer[5] < 117) { // Keys 117 - 132 reserved
@@ -1027,6 +1030,25 @@ void okcrypto_derive_key (uint8_t ktype, uint8_t *data, uint8_t slot) {
 		Serial.println("HKDF Key");
 		byteprint(ecc_private_key,32);
 		#endif
+  	} else if (slot==RESERVED_KEY_DERIVATION) { // Agent derivation v2: HKDF from the same slot-132 key
+		// sk = HKDF-SHA256(salt=[0x20|data32], IKM=K132, info="onlykey/agent/v2", L=32)
+		// v1 (slot==0 above) is SHA256(K132||data32) and stays the default for
+		// existing identities; v2 is selected by codes 221-224 / 232. The IKM
+		// (slot 132, not the web key), the salt flag (0x20, disjoint from the
+		// web flags 0-3) and the info string all differ from the web keys.
+		uint8_t v2salt[33];
+		static const char V2INFO[] = "onlykey/agent/v2";
+		okcore_flashget_ECC (RESERVED_KEY_DERIVATION);
+		memset(ecc_public_key, 0, sizeof(ecc_public_key));
+		v2salt[0] = 0x20;
+		memcpy(v2salt + 1, data, 32);
+		okcrypto_hkdf_info(v2salt, ecc_private_key, ecc_private_key, 32, (const uint8_t *)V2INFO, sizeof(V2INFO) - 1);
+		memset(v2salt, 0, sizeof(v2salt));
+		#ifdef DEBUG
+		Serial.println();
+		Serial.println("Agent derivation v2 private key");
+		byteprint(ecc_private_key,32);
+		#endif
   	}
 	type=ktype;
 	okcrypto_compute_pubkey();
@@ -1066,7 +1088,8 @@ void okcrypto_ecdsa_eddsa(uint8_t *buffer)
 			 * uninitialised ecc_signature[64] as if it were a signature.
 			 * Reject it rather than letting stale state decide. */
 			if (buffer[5] != 201 && buffer[5] != 202 && buffer[5] != 203 &&
-			    buffer[5] != 211 && buffer[5] != 212 && buffer[5] != 213) {
+			    buffer[5] != 211 && buffer[5] != 212 && buffer[5] != 213 &&
+			    buffer[5] != 221 && buffer[5] != 222 && buffer[5] != 223) {
 				hidprint("Error invalid derived key slot");
 				fadeoff(0);
 				return;
@@ -1088,6 +1111,10 @@ void okcrypto_ecdsa_eddsa(uint8_t *buffer)
 			}
 			else if (buffer[5] == 213) {
 				okcrypto_derive_key(3, large_buffer+(large_buffer_offset-32), RESERVED_KEY_WEB_AGENT_DERIVATION);
+			}
+			else if (buffer[5] > DERIVATION_V2_CODE_BASE && buffer[5] < DERIVATION_V2_CODE_BASE + 4) {
+				// v2 (HKDF) agent derivation: 221 ed25519, 222 p256, 223 secp256k1
+				okcrypto_derive_key(buffer[5] - DERIVATION_V2_CODE_BASE, large_buffer+(large_buffer_offset-32), RESERVED_KEY_DERIVATION);
 			}
 			large_buffer_offset = large_buffer_offset - 32;
 		}
@@ -1198,7 +1225,18 @@ void okcrypto_ecdh(uint8_t *buffer) {
 		Serial.println(large_buffer_offset);
 		byteprint(large_buffer, large_buffer_offset);
 		#endif
-		if (buffer[5] > 201) {
+		if (buffer[5] > 200) {
+			/* The decrypt set is 202-204, 212-214 and 222-224 (keytype 2-4; an
+			 * Ed25519 key, 201/211/221, has no ECDH). Anything else used to fall
+			 * through the chain below with ecc_private_key and `type` left over
+			 * from whatever ran last - the same stale-state hole the sign path
+			 * closes - so it is refused here instead. */
+			if (!((buffer[5] > 201 && buffer[5] < 205) || (buffer[5] > 211 && buffer[5] < 215) ||
+			      (buffer[5] > DERIVATION_V2_CODE_BASE + 1 && buffer[5] < DERIVATION_V2_CODE_BASE + 5))) {
+				hidprint("Error invalid derived key slot");
+				fadeoff(0);
+				return;
+			}
 			if (buffer[5] == 202) {
 				okcrypto_derive_key(2, large_buffer+(large_buffer_offset-32), 0);
 			}
@@ -1215,6 +1253,10 @@ void okcrypto_ecdh(uint8_t *buffer) {
 			} 
 			else if (buffer[5] == 214) {
 				okcrypto_derive_key(4, large_buffer+(large_buffer_offset-32), RESERVED_KEY_WEB_AGENT_DERIVATION); 
+			}
+			else if (buffer[5] > DERIVATION_V2_CODE_BASE + 1 && buffer[5] < DERIVATION_V2_CODE_BASE + 5) {
+				// v2 (HKDF) agent derivation: 222 p256, 223 secp256k1, 224 curve25519
+				okcrypto_derive_key(buffer[5] - DERIVATION_V2_CODE_BASE, large_buffer+(large_buffer_offset-32), RESERVED_KEY_DERIVATION);
 			} 
 			large_buffer_offset = large_buffer_offset - 32; //Remove derivation data hash
 		}
@@ -1906,6 +1948,13 @@ int mbedtls_rand( void *rng_state, unsigned char *output, size_t len ) {
  * so the PRK is identical and the info string is what keeps the outputs apart. */
 void okcrypto_hkdf(const void *salt, const void *inputKey, void *outputKey, const size_t L) {
 	static const char INFO[] = "onlykey/derive/ecc/v2";
+	okcrypto_hkdf_info(salt, inputKey, outputKey, L, (const uint8_t *)INFO, sizeof(INFO) - 1);
+}
+
+/* The same HKDF with the caller's info string - agent derivation v2 uses
+ * "onlykey/agent/v2". Salt is 33 bytes, or NULL for 33 zero bytes. */
+void okcrypto_hkdf_info(const void *salt, const void *inputKey, void *outputKey, const size_t L,
+                        const uint8_t *info, size_t info_len) {
 	// 33, not 32: the salt is the 33-byte additional_data ([flag][32-byte tag]),
 	// and the salt == NULL branch zero-fills and HMAC-keys 33 bytes from here.
 	uint8_t tmp[33];
@@ -1929,7 +1978,7 @@ void okcrypto_hkdf(const void *salt, const void *inputKey, void *outputKey, cons
 	hash.finalizeHMAC(s, 33, PRK, sizeof(PRK));
 	hash.clear();
 
-	okcrypto_hkdf_expand(PRK, (const uint8_t *)INFO, sizeof(INFO) - 1, (uint8_t *)outputKey, L);
+	okcrypto_hkdf_expand(PRK, info, info_len, (uint8_t *)outputKey, L);
 	memset(PRK, 0, sizeof(PRK));
 }
 

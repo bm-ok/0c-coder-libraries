@@ -205,7 +205,8 @@ int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
         // to say so. Derived keys are label-scoped and reproducible; a stored
         // PGP key is neither, so they do not belong behind the same switch.
         //
-        // Default (unwritten policy byte) is therefore: derive yes, PGP no.
+        // An unwritten policy byte keeps v3.0.4's behaviour (derive yes, PGP
+        // yes) - see okcore_webcrypt_policy(); writing 0 means derive only.
         return (wc_policy & OKWC_ALLOW_STORED_KEY) ? 2 : 1;
     }
     // The old bit 2 escape hatch is GONE. It let an origin that matches NONE of

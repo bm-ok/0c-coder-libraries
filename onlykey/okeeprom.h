@@ -463,8 +463,9 @@ extern "C"
 /* Webcrypt policy: WHAT the browser may do, as opposed to field 30's HOW the
  * user confirms it. Deliberately a separate byte - packing "may it happen" and
  * "how is it confirmed" into one byte is what produced the enum-versus-bitfield
- * collision in field 21. Unwritten EEPROM reads 0xFF, which okcore_webcrypt_policy()
- * treats as "never configured" and resolves from the legacy field-21 byte. */
+ * collision in field 21. Stored as (policy | OKWC_WRITTEN): unwritten EEPROM reads
+ * 0xFF on a new part and 0x00 after any wipe, and okcore_webcrypt_policy() treats
+ * both as "never configured" and resolves from the legacy field-21 byte. */
 #define EElen_webcrypt_policy 1
 #define EEpos_webcrypt_policy (EEpos_web_agent_derive_mode + EElen_web_agent_derive_mode)
 

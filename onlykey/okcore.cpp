@@ -2120,7 +2120,12 @@ void set_slot(uint8_t *buffer)
 			Serial.println();
 			Serial.println("Writing webcrypt_policy to EEPROM...");
 			#endif
-			okeeprom_eeset_webcrypt_policy(buffer + 7);
+			{
+				// Stored with the OKWC_WRITTEN marker: 0x00 (wiped EEPROM) and
+				// 0xFF (new EEPROM) must both still read as "never written".
+				uint8_t wc_stored = (uint8_t)(buffer[7] | OKWC_WRITTEN);
+				okeeprom_eeset_webcrypt_policy(&wc_stored);
+			}
 			hidprint("Successfully set webcrypt policy");
 		}
 		else
@@ -6169,7 +6174,8 @@ bool wipebuffersafter5sec(Task *me)
  * direction a migration must never take, and "it is in the release notes" is
  * not a mitigation - a key in a drawer does not read release notes.
  *
- * So: while field 31 is unwritten (erased EEPROM reads 0xFF), the disable bit is
+ * So: while field 31 is unwritten (0xFF on a new part, 0x00 after any wipe -
+ * OKWC_IS_WRITTEN() treats both as unwritten), the disable bit is
  * inherited from legacy field 21 bit 1. The first explicit write of field 31
  * ends the inheritance permanently - from then on the user's stated policy is
  * the whole answer, including turning the extension back on.
@@ -6181,7 +6187,7 @@ bool wipebuffersafter5sec(Task *me)
 uint8_t okcore_webcrypt_policy() {
 	uint8_t policy = OKWC_UNSET;
 	okeeprom_eeget_webcrypt_policy(&policy);
-	if (policy != OKWC_UNSET) return policy & OKWC_VALID_MASK;
+	if (OKWC_IS_WRITTEN(policy)) return policy & OKWC_VALID_MASK;
 
 	/* Unwritten: the v3.0.4 behaviour. apps.crp.to could use stored keys (PGP)
 	 * by default there, so a key upgraded from it - and a new key, which is
@@ -6237,7 +6243,7 @@ uint8_t okcore_user_input_mode_for_slot(uint8_t slot) {
 	if (derived && mode == USER_INPUT_NONE) {
 		uint8_t policy_raw = OKWC_UNSET;
 		okeeprom_eeget_webcrypt_policy(&policy_raw);
-		if (policy_raw == OKWC_UNSET) mode = USER_INPUT_CHALLENGE;
+		if (!OKWC_IS_WRITTEN(policy_raw)) mode = USER_INPUT_CHALLENGE;
 	}
 
 	#ifndef OK_ALLOW_NO_PRESS

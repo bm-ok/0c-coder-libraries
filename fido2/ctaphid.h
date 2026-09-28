@@ -101,6 +101,8 @@ void ctaphid_init();
 
 uint8_t ctaphid_handle_packet(uint8_t *pkt_raw);
 
+int ctaphid_buffering(void);
+
 void ctaphid_check_timeouts();
 
 void ctaphid_update_status(int8_t status);

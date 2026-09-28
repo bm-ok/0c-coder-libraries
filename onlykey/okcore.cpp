@@ -5556,7 +5556,13 @@ void wipetasks() {
     packet_buffer_offset = 0;
     memset(rsa_private_key, 0, MAX_RSA_KEY_SIZE);
     memset(ecc_private_key, 0, MAX_ECC_KEY_SIZE);
-    memset(ctap_buffer, 0, CTAPHID_BUFFER_SIZE);
+    /* Not while a CTAPHID message is still arriving: the packets already
+     * received are in ctap_buffer, and the rest is appended to them. Wiping
+     * here (e.g. from the 5-second timer) left the reassembly state intact
+     * and the start of the message zeroed, so the request failed with
+     * CTAP1_ERR_INVALID_COMMAND. A stalled message is still dropped by
+     * ctaphid_check_timeouts(), and everything else is wiped as before. */
+    if (!ctaphid_buffering()) memset(ctap_buffer, 0, CTAPHID_BUFFER_SIZE);
     memset(large_resp_buffer, 0, LARGE_RESP_BUFFER_SIZE);
     memset(keyboard_buffer, 0, KEYBOARD_BUFFER_SIZE);
     memset(packet_buffer_details, 0, sizeof(packet_buffer_details));

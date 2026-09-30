@@ -421,6 +421,7 @@ void okcrypto_decrypt(uint8_t *buffer) {
         // On the last chunk the confirmation is primed over SHA-256 of the
         // request; okcore_run_pending_op() calls back here with CRYPTO_AUTH == 4.
         if (CRYPTO_AUTH == 4) {
+            outputmode = packet_buffer_details[2];
             if (derive_pending != 1) {
                 hidprint("Error no derived decaps request pending");
                 fadeoff(0);
@@ -496,6 +497,7 @@ void okcrypto_decrypt(uint8_t *buffer) {
             sha256_final(&ch, chmsg);
             okcore_prime_user_confirmation(OKDECRYPT, RESERVED_KEY_WEB_AGENT_DERIVATION,
                 chmsg, sizeof(chmsg));
+            packet_buffer_details[2] = outputmode;
             memset(chmsg, 0, sizeof(chmsg));
         }
         pending_operation = OKDECRYPT_ERR_USER_ACTION_PENDING;
@@ -582,6 +584,8 @@ void okcrypto_generate_random_key(uint8_t *buffer) {
             uECC_make_key(ecc_public_key, buffer + 7, curve);
         } else if ((buffer[6] & 0x0F) == KEYTYPE_CURVE25519) {
             RNG2(buffer + 7, 32);
+            buffer[7 + 31] &= 0xF8;
+            buffer[7] = (buffer[7] & 0x7F) | 0x40;
         }
         memset(ecc_public_key, 0, sizeof(ecc_public_key));
     }
@@ -776,6 +780,10 @@ void okcrypto_derive_key(uint8_t ktype, uint8_t *data, uint8_t slot) {
         Serial.println("Agent derivation v2 private key");
         byteprint(ecc_private_key, 32);
 #endif
+    }
+    if (slot && ktype == KEYTYPE_CURVE25519) {
+        ecc_private_key[31] &= 0xF8;
+        ecc_private_key[0] = (ecc_private_key[0] & 0x7F) | 0x40;
     }
     type = ktype;
     okcrypto_compute_pubkey();
@@ -1133,9 +1141,12 @@ int okcrypto_shared_secret(uint8_t *pub, uint8_t *secret) {
                 return 0;
             } else
                 return 1;
-        case KEYTYPE_CURVE25519:
+        case KEYTYPE_CURVE25519: {
+            uint8_t nonzero = 0;
             Curve25519::eval(secret, ecc_private_key, pub);
-            return 0;
+            for (int i = 0; i < 32; i++) nonzero |= secret[i];
+            return nonzero ? 0 : 1;
+        }
         case KEYTYPE_ECDH_P256R:
             curve = uECC_secp256r1();
             if (uECC_shared_secret2(pub, ecc_private_key, secret, curve)) {

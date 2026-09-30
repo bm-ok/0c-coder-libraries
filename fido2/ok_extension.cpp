@@ -426,9 +426,15 @@ int16_t bridge_to_onlykey(uint8_t *_appid, uint8_t *keyh, int handle_len, uint8_
                     return ret;
                 }
                 int i = 0;
-                if (!last_request_opt3)
+                if (!last_request_opt3) {
                     last_request_opt3 = opt3; // first packet
-                else if (opt3 <= last_request_opt3)
+                    if (cmd == OKDECRYPT || cmd == OKSIGN) {
+                        memset(large_resp_buffer, 0, LARGE_RESP_BUFFER_SIZE);
+                        large_resp_buffer_offset = 0;
+                        large_resp_buffer_cursor = 0;
+                        large_resp_buffer_last_opt3 = 0;
+                    }
+                } else if (opt3 <= last_request_opt3)
                     return 0; // duplicate packet, thanks to win 10 1903 sending all FIDO2 messages twice
 
                 while (handle_len > 0) { // Max size packet minus header
@@ -499,12 +505,11 @@ int16_t send_stored_response(uint8_t *output, uint8_t opt3) {
 #endif
             ret = CTAP2_ERR_OPERATION_PENDING;
         } else if (large_resp_buffer_offset) {
-            // Duplicate poll (non-zero opt3 not above the last one): serve the
-            // previous chunk again.
-            int is_duplicate = opt3 && large_resp_buffer_last_opt3 && opt3 <= large_resp_buffer_last_opt3;
-            int chunk_start = is_duplicate
-                ? (large_resp_buffer_cursor > MAX_LARGE_RESP_CHUNK ? large_resp_buffer_cursor - MAX_LARGE_RESP_CHUNK : 0)
-                : large_resp_buffer_cursor;
+            int delivered = large_resp_buffer_cursor >= large_resp_buffer_offset;
+            int is_duplicate = delivered || (opt3 && large_resp_buffer_last_opt3 && opt3 <= large_resp_buffer_last_opt3);
+            int chunk_start = large_resp_buffer_cursor;
+            if (is_duplicate && large_resp_buffer_cursor)
+                chunk_start = (large_resp_buffer_cursor - 1) / MAX_LARGE_RESP_CHUNK * MAX_LARGE_RESP_CHUNK;
             int remaining = large_resp_buffer_offset - chunk_start;
             int chunk_len = remaining > MAX_LARGE_RESP_CHUNK ? MAX_LARGE_RESP_CHUNK : remaining;
 #ifdef DEBUG
@@ -532,11 +537,10 @@ int16_t send_stored_response(uint8_t *output, uint8_t opt3) {
             // This means we can't wipe the response after it's retrieved, have to wipe
             // based on a timer
             //memset(large_resp_buffer, 0, LARGE_RESP_BUFFER_SIZE);
+            if (is_duplicate) return ret;
             wipedata(); // restarts the wipe timer
             if (large_resp_buffer_cursor >= large_resp_buffer_offset) {
                 pending_operation = CTAP2_ERR_DATA_WIPE;
-                large_resp_buffer_cursor = 0;
-                large_resp_buffer_last_opt3 = 0;
             }
         } else if (CRYPTO_AUTH || packet_buffer_offset) {
 #ifdef DEBUG

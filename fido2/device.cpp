@@ -37,6 +37,8 @@ extern uint8_t profilemode;
 extern int large_buffer_offset;
 extern uint8_t *large_resp_buffer;
 extern int large_resp_buffer_offset;
+extern int large_resp_buffer_cursor;
+extern uint8_t large_resp_buffer_last_opt3;
 extern int packet_buffer_offset;
 extern uint8_t recv_buffer[64];
 extern uint8_t resp_buffer[64];
@@ -185,6 +187,9 @@ void store_FIDO_response(uint8_t *data, int len, uint8_t encrypt) {
         memmove(large_resp_buffer, data, len);
         large_resp_buffer_offset = len;
     }
+
+    large_resp_buffer_cursor = 0;
+    large_resp_buffer_last_opt3 = 0;
 
 #ifdef DEBUG
     Serial.print("Stored Data for FIDO Response ");
